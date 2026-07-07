@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+qa_results/
+recordings/
+mirror_server.before_*.py
+*.bak
+*.backup
+*.old
+*.orig
+*.tmp
