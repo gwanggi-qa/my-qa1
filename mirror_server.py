@@ -168,17 +168,25 @@ class BlockedStep(Exception):
     pass
 
 
-def adb(*args: str):
+class RandomStopped(Exception):
+    pass
+
+
+def adb(*args: str, timeout_s=None):
     cmd = ["adb"]
     if ADB_SERIAL:
         cmd += ["-s", ADB_SERIAL]
     cmd += list(args)
-    result = subprocess.run(cmd, capture_output=True)
-    return result.stdout, result.stderr, result.returncode
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        message = f"ADB command timed out after {timeout_s}s".encode("utf-8")
+        return b"", message, 124
 
 
 def check_device():
-    out, _, _ = adb("devices")
+    out, _, _ = adb("devices", timeout_s=4)
     lines = out.decode(errors="ignore").strip().splitlines()
     return any("\tdevice" in line or line.endswith(" device") for line in lines[1:])
 
@@ -198,6 +206,7 @@ def get_device_info():
     manufacturer = adb_text("shell", "getprop", "ro.product.manufacturer")
     model = adb_text("shell", "getprop", "ro.product.model")
     device = adb_text("shell", "getprop", "ro.product.device")
+    market_name = adb_text("shell", "getprop", "ro.product.marketname")
     android_version = adb_text("shell", "getprop", "ro.build.version.release")
     sdk = adb_text("shell", "getprop", "ro.build.version.sdk")
     resolution = adb_text("shell", "wm", "size").replace("Physical size:", "").strip()
@@ -218,6 +227,7 @@ def get_device_info():
         "manufacturer": manufacturer,
         "model": model,
         "device": device,
+        "market_name": market_name,
         "android": android_version,
         "sdk": sdk,
         "resolution": resolution,
@@ -682,8 +692,10 @@ def adb_text_arg(text):
 
 
 def dump_ui_xml():
-    adb("shell", "uiautomator", "dump", "/sdcard/window_dump.xml")
-    out, _, rc = adb("exec-out", "cat", "/sdcard/window_dump.xml")
+    _, _, dump_rc = adb("shell", "uiautomator", "dump", "/sdcard/window_dump.xml", timeout_s=7)
+    if dump_rc != 0:
+        return ""
+    out, _, rc = adb("exec-out", "cat", "/sdcard/window_dump.xml", timeout_s=4)
     if rc != 0:
         return ""
     return out.decode("utf-8", errors="ignore")
@@ -696,17 +708,27 @@ def capture_screen_hash():
     return hashlib.sha1(raw).hexdigest()
 
 
-def wait_for_screen_change(before_hash, timeout_s=5.0):
+def wait_for_screen_change(before_hash, timeout_s=5.0, stop_event=None):
     if not before_hash:
-        time.sleep(1.0)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if stop_event and stop_event.is_set():
+                return False
+            time.sleep(min(0.1, max(0, deadline - time.time())))
         return False
 
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        time.sleep(0.35)
+        if stop_event and stop_event.is_set():
+            return False
+        time.sleep(min(0.35, max(0, deadline - time.time())))
         after_hash = capture_screen_hash()
         if after_hash and after_hash != before_hash:
-            time.sleep(1.0)
+            stable_deadline = time.time() + 1.0
+            while time.time() < stable_deadline:
+                if stop_event and stop_event.is_set():
+                    return True
+                time.sleep(min(0.1, max(0, stable_deadline - time.time())))
             return True
     return False
 
@@ -901,6 +923,26 @@ def bounds_center(bounds):
 
 
 def ui_node_score(label, attrs, center):
+    priority_keywords = ("Unit", "MY", "JLPT", "N1", "N2", "N3", "N4", "N5", "학습", "문법", "독해", "단어", "문제", "퀴즈")
+    score = 4
+    if label:
+        score += 3
+    if "Tab" in label:
+        score += 2
+    if any(keyword.lower() in label.lower() for keyword in priority_keywords):
+        score += 3
+    if attrs.get("scrollable") == "true":
+        score += 2
+    if attrs.get("selected") == "true":
+        score -= 2
+    if attrs.get("enabled") == "false":
+        score -= 6
+    if center["area"] < 1600:
+        score -= 3
+    if not label and attrs.get("clickable") == "true":
+        score -= 1
+    return max(1, score)
+
     score = 4
     if label:
         score += 3
@@ -1476,6 +1518,8 @@ def play_recording_steps(recording, repeat_count=1):
 def execute_random_action(plan_item):
     step = plan_item["step"]
     before_hash = capture_screen_hash()
+    if random_stop_requested():
+        raise RandomStopped("Random run stopped")
 
     if step["action"] == "swipe":
         _, err, rc = adb(
@@ -1496,7 +1540,13 @@ def execute_random_action(plan_item):
     if rc:
         raise RuntimeError(err.decode(errors="ignore") or "ADB input failed")
 
-    changed = wait_for_screen_change(before_hash, timeout_s=4.0)
+    if random_stop_requested():
+        raise RandomStopped("Random run stopped")
+
+    changed = wait_for_screen_change(before_hash, timeout_s=4.0, stop_event=_random_stop_event)
+    if random_stop_requested():
+        raise RandomStopped("Random run stopped")
+
     errors = detect_runtime_errors()
     if errors:
         raise AssertionError("; ".join(errors))
@@ -1506,20 +1556,38 @@ def execute_random_action(plan_item):
     return f"{action_message}; screen changed"
 
 
+def random_stop_requested():
+    return _random_stop_event.is_set()
+
+
+def random_sleep_with_stop(delay_ms):
+    if delay_ms <= 0:
+        return False
+    deadline = time.time() + (delay_ms / 1000)
+    while time.time() < deadline:
+        if random_stop_requested():
+            return True
+        time.sleep(min(0.1, max(0, deadline - time.time())))
+    return random_stop_requested()
+
+
 def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_actions=None):
     global _random_running, _random_last_plan
 
     passed = 0
     failed = 0
+    stopped = 0
+    total = max_steps
     mode = "dry-run" if dry_run else "live"
-    plan = build_random_plan(max_steps=max_steps, memory_actions=memory_actions or [])
-    total = len(plan)
-    _random_last_plan = plan
-    emit_random_started(total, mode)
 
     try:
         if not check_device():
             raise RuntimeError("No adb device. Check USB connection and USB debugging.")
+
+        emit_random_started(total, mode)
+        plan = build_random_plan(max_steps=max_steps, memory_actions=memory_actions or [])
+        _random_last_plan = plan
+
         if not plan:
             raise RuntimeError("No clickable or scrollable UI candidates found.")
 
@@ -1527,7 +1595,7 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
             adb("logcat", "-c")
 
         for plan_item in plan:
-            if _random_stop_event.is_set():
+            if random_stop_requested():
                 break
 
             index = plan_item["index"]
@@ -1542,6 +1610,9 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
             )
 
             try:
+                if random_stop_requested():
+                    raise RandomStopped("Random run stopped")
+
                 if dry_run:
                     message = (
                         f"Would {step['action']} '{step['target']}' "
@@ -1549,7 +1620,8 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                     )
                 else:
                     message = execute_random_action(plan_item)
-                    time.sleep(max(0, delay_ms) / 1000)
+                    if random_sleep_with_stop(delay_ms):
+                        raise RandomStopped("Random run stopped")
 
                 passed += 1
                 emit_random_progress(
@@ -1560,6 +1632,17 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                     f"{plan_item['candidate'].get('source', 'ui-analysis')}: {message}",
                     {"candidate": plan_item["candidate"], "risk": plan_item["risk"]},
                 )
+            except RandomStopped as exc:
+                stopped += 1
+                emit_random_progress(
+                    index,
+                    total,
+                    "stopped",
+                    step,
+                    f"{plan_item['candidate'].get('source', 'ui-analysis')}: {exc}",
+                    {"candidate": plan_item["candidate"], "risk": plan_item["risk"]},
+                )
+                break
             except Exception as exc:
                 failed += 1
                 extra = failure_extra(
@@ -1587,6 +1670,7 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                 "total": total,
                 "passed": passed,
                 "failed": failed,
+                "stopped": stopped,
                 "mode": mode,
                 "finished_at": time.strftime("%H:%M:%S"),
             },
@@ -2517,6 +2601,7 @@ HTML = r"""
     .badge.passed { background: var(--accent); }
     .badge.failed { background: var(--danger); }
     .badge.blocked { background: #8f6a27; }
+    .badge.stopped { background: #6b7280; }
 
     .result-link {
       color: #8ec5ff;
@@ -2844,7 +2929,13 @@ HTML = r"""
       }
     });
 
-    screen.addEventListener('load', fitScreenToStage);
+    screen.addEventListener('load', () => {
+      fitScreenToStage();
+      syncRandomControls();
+      if (isActiveTab('random-test') && !isRandomRunning) {
+        statusLabel.textContent = 'Random Test ready';
+      }
+    });
     setupScreenInput();
     recordSelect.addEventListener('change', () => {
       selectedRecordingId = recordSelect.value || '';
@@ -2856,7 +2947,7 @@ HTML = r"""
       });
     });
     setProgressFilter(activeProgressFilter);
-    updateRandomMemoryControls();
+    syncRandomControls();
     renderRecordedActions();
     updateRecorderControls();
 
@@ -2891,6 +2982,7 @@ HTML = r"""
       randomState.textContent = label;
       runSummary.textContent = `0 / ${data.total}`;
       resetProgressState();
+      setProgressFilter('passed');
       setRandomRunning(true);
     });
 
@@ -2902,12 +2994,22 @@ HTML = r"""
     socket.on('random_error', (data) => {
       statusLabel.textContent = data.msg || 'Random explorer error';
       randomState.textContent = 'Error';
+      setRandomRunning(false);
     });
 
     socket.on('random_run_finished', (data) => {
       const label = data.mode === 'dry-run' ? 'Dry Run' : 'Live Run';
-      statusLabel.textContent = `${label} done: ${data.passed} passed, ${data.failed} failed, 0 blocked`;
-      runSummary.textContent = `${data.passed} passed / ${data.failed} failed / 0 blocked`;
+      const stopped = data.stopped || 0;
+      const done = (data.passed || 0) + (data.failed || 0) + stopped;
+      const hadError = randomState.textContent === 'Error' && done === 0;
+      statusLabel.textContent = stopped
+        ? `${label} stopped: ${data.passed} passed, ${data.failed} failed`
+        : hadError
+          ? statusLabel.textContent
+        : `${label} done: ${data.passed} passed, ${data.failed} failed, 0 blocked`;
+      runSummary.textContent = stopped
+        ? `${done} / ${data.total} - ${data.passed} passed / ${data.failed} failed / ${stopped} stopped`
+        : `${done} / ${data.total} - ${data.passed} passed / ${data.failed} failed / 0 blocked`;
       randomState.textContent = 'Idle';
       setRandomRunning(false);
     });
@@ -2948,8 +3050,10 @@ HTML = r"""
         return;
       }
 
-      const modelParts = [data.manufacturer, data.model].filter(Boolean);
+      const modelName = data.model || data.market_name || data.device || '';
+      const modelParts = [data.manufacturer, modelName].filter(Boolean);
       deviceState.textContent = 'Connected';
+      deviceModel.textContent = modelParts.length ? modelParts.join(' ') : '-';
       deviceResolution.textContent = data.resolution || '-';
       deviceAndroid.textContent = data.android ? `Android ${data.android} (SDK ${data.sdk || '-'})` : '-';
       deviceDensity.textContent = data.density ? `${data.density} dpi` : '-';
@@ -3070,23 +3174,32 @@ HTML = r"""
         action.duration_ms = payload.duration_ms;
       }
       randomMemoryActions.push(action);
-      updateRandomMemoryControls();
+      syncRandomControls();
     }
 
     function clearRandomMemory() {
       randomMemoryActions = [];
-      updateRandomMemoryControls();
+      syncRandomControls();
       statusLabel.textContent = isRandomMemoryActive
         ? 'Memory cleared. Continue remembering taps and swipes.'
         : 'Memory cleared.';
     }
 
     function updateRandomMemoryControls() {
+      syncRandomControls();
+    }
+
+    function syncRandomControls() {
       randomMemoryLabel.textContent = isRandomMemoryActive ? 'Memory ON' : 'Memory';
       randomMemoryState.textContent = `Memory: ${randomMemoryActions.length} actions`;
       randomMemoryState.classList.toggle('active', isRandomMemoryActive);
       randomMemoryButton.classList.toggle('active', isRandomMemoryActive);
+      randomMemoryButton.disabled = isRandomRunning;
+      randomLiveButton.disabled = isRandomRunning;
       randomMemoryClearButton.disabled = isRandomRunning || randomMemoryActions.length === 0;
+      randomStopButton.disabled = !isRandomRunning;
+      randomSteps.disabled = isRandomRunning;
+      randomDelay.disabled = isRandomRunning;
     }
 
     async function runRandom() {
@@ -3095,38 +3208,56 @@ HTML = r"""
 
       setRandomRunning(true);
       statusLabel.textContent = `Preparing live random run with ${randomMemoryActions.length} memory actions`;
-      const response = await fetch('/api/random/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          dry_run: false,
-          steps,
-          delay_ms: delayMs,
-          memory_actions: randomMemoryActions
-        })
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        statusLabel.textContent = data.error || 'Random explorer failed';
+      try {
+        const response = await fetch('/api/random/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dry_run: false,
+            steps,
+            delay_ms: delayMs,
+            memory_actions: randomMemoryActions
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          statusLabel.textContent = data.error || 'Random explorer failed';
+          randomState.textContent = 'Idle';
+          setRandomRunning(false);
+        }
+      } catch (error) {
+        statusLabel.textContent = 'Random explorer failed';
         randomState.textContent = 'Idle';
         setRandomRunning(false);
       }
     }
 
     async function stopRandom() {
-      randomState.textContent = 'Stopping';
-      await fetch('/api/random/stop', { method: 'POST' });
+      if (!isRandomRunning) {
+        return;
+      }
+      randomState.textContent = 'Stopping...';
+      statusLabel.textContent = 'Stopping random test';
+      randomStopButton.disabled = true;
+      try {
+        const response = await fetch('/api/random/stop', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) {
+          statusLabel.textContent = data.error || 'Stop random failed';
+          randomState.textContent = 'Live Run';
+          syncRandomControls();
+        }
+      } catch (error) {
+        statusLabel.textContent = 'Stop random failed';
+        randomState.textContent = 'Live Run';
+        syncRandomControls();
+      }
     }
 
     function setRandomRunning(running) {
       isRandomRunning = running;
-      randomMemoryButton.disabled = running;
-      randomLiveButton.disabled = running;
-      randomStopButton.disabled = !running;
-      randomSteps.disabled = running;
-      randomDelay.disabled = running;
       runButton.disabled = running || isTestRunning || loadedSteps.length === 0;
-      updateRandomMemoryControls();
+      syncRandomControls();
     }
 
     function clampNumber(value, min, max, fallback) {
@@ -3339,6 +3470,19 @@ HTML = r"""
       document.querySelectorAll('.tab-pane').forEach((pane) => {
         pane.classList.toggle('active', pane.id === `tab-${tabName}`);
       });
+      if (tabName === 'random-test') {
+        syncRandomControls();
+        if (!isRandomRunning) {
+          statusLabel.textContent = screen.naturalWidth && screen.naturalHeight
+            ? 'Random Test ready'
+            : 'Mirroring required for Memory';
+        }
+      }
+    }
+
+    function isActiveTab(tabName) {
+      const activeButton = document.querySelector('.tab-button.active');
+      return activeButton && activeButton.dataset.tab === tabName;
     }
 
     function updateMouseInfo(clientX, clientY) {
@@ -3634,7 +3778,7 @@ HTML = r"""
     }
 
     function isCompletedProgressStatus(status) {
-      return ['passed', 'failed', 'blocked'].includes(status);
+      return ['passed', 'failed', 'blocked', 'stopped'].includes(status);
     }
 
     function progressCounts() {
@@ -3662,12 +3806,12 @@ HTML = r"""
 
     function updateRunSummary(index, total) {
       const counts = progressCounts();
-      runSummary.textContent = `${index} / ${total} ??${counts.passed} passed / ${counts.failed} failed / ${counts.blocked} blocked`;
+      runSummary.textContent = `${index} / ${total} - ${counts.passed} passed / ${counts.failed} failed / ${counts.blocked} blocked`;
     }
 
     function renderProgressList() {
       const rows = Array.from(progressItems.values())
-        .filter((item) => item.status === activeProgressFilter)
+        .filter((item) => item.status === activeProgressFilter || (activeProgressFilter === 'failed' && item.status === 'stopped'))
         .sort((left, right) => left.index - right.index);
 
       if (!rows.length) {
@@ -3685,6 +3829,7 @@ HTML = r"""
     function progressFilterLabel(status) {
       if (status === 'passed') return 'Pass';
       if (status === 'failed') return 'Fail';
+      if (status === 'stopped') return 'Stopped';
       return 'Block(N/A)';
     }
 
