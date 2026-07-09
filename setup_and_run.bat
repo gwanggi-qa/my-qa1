@@ -28,7 +28,7 @@ if errorlevel 1 (
 :: Install pip packages
 echo [1/3] Installing Python packages...
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet flask flask-socketio pillow openpyxl Appium-Python-Client selenium
+python -m pip install --quiet flask flask-socketio pillow openpyxl Appium-Python-Client selenium easyocr numpy opencv-python-headless torch
 
 if errorlevel 1 (
     echo [ERROR] Package install failed. Check your internet connection.

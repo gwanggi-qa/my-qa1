@@ -7,6 +7,7 @@ Excel test case upload -> ADB based tablet validation runner.
 import base64
 import hashlib
 import html as html_lib
+import importlib.util
 import io
 import json
 import random
@@ -29,6 +30,8 @@ ADB_SERIAL = ""
 BASE_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = BASE_DIR / "recordings"
 QA_RESULTS_DIR = BASE_DIR / "qa_results"
+OCR_LANGS = ["ko", "en"]
+OCR_MIN_CONFIDENCE = 0.35
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "tablet-mirror-secret"
@@ -48,6 +51,14 @@ _random_last_plan: list[dict[str, Any]] = []
 _record_play_lock = threading.Lock()
 _record_play_running = False
 _record_play_stop_event = threading.Event()
+_ocr_lock = threading.Lock()
+_ocr_reader = None
+_ocr_status: dict[str, Any] = {
+    "available": None,
+    "state": "idle",
+    "message": "OCR not loaded",
+    "languages": OCR_LANGS,
+}
 
 
 HEADER_ALIASES = {
@@ -153,6 +164,63 @@ MANUAL_QA_VISUAL_ONLY_PATTERNS = [
     "\ubaa8\uc591",
     "\uadf8\ub798\ud504",
 ]
+
+WORDP_HEADER_ALIASES = {
+    "code": {"코드번호", "code"},
+    "subject": {"과목명"},
+    "case_no": {"no", "번호"},
+    "major": {"대분류"},
+    "middle": {"중분류"},
+    "feature": {"기능"},
+    "precondition": {"전제조건"},
+    "item": {"테스트항목", "테스트내용", "testcase", "testitem"},
+    "expected": {"기대결과", "expectedresult", "expected"},
+    "result": {"검증결과", "검증결과pfntna", "result"},
+    "note": {"비고", "오류보고내역"},
+}
+
+WORDP_TAP_WORDS = ("버튼", "누른다", "터치", "클릭", "선택", "저장", "취소", "확인")
+WORDP_SWIPE_WORDS = ("스크롤", "드래그")
+WORDP_INPUT_WORDS = ("입력",)
+WORDP_BLOCK_PATTERNS = (
+    "강제종료",
+    "재실행",
+    "기기설정",
+    "전원버튼",
+    "화면 Off",
+    "back키",
+    "back버튼",
+    "Off-Line",
+    "오프라인",
+    "폴더",
+    "태스크바",
+    "반복",
+    "Q10~Q15",
+    "Q15까지",
+    "모든 항목",
+)
+WORDP_ACTION_LABELS = (
+    "프로필 추가",
+    "저장",
+    "취소",
+    "확인",
+    "설문제출",
+    "설문 제출",
+    "설문완료",
+    "설정완료",
+    "학습 시작",
+    "맞춤 커리큘럼으로 학습 시작",
+    "다시 학습하기",
+    "홈",
+    "이전",
+    "다음",
+    "닫기",
+    "시작",
+    "건너뛰기",
+    "돌아가기",
+    "삭제",
+)
+WORDP_GENERIC_LABELS = {"위치", "곳", "항목", "내용", "영역", "화면"}
 @dataclass
 class StepResult:
     index: int
@@ -505,6 +573,244 @@ def parse_manual_qa_excel(workbook):
     return steps
 
 
+def normalize_wordp_header(value: Any):
+    text = str(value or "").strip().lower()
+    return re.sub(r"[\s_\-().,/]+", "", text)
+
+
+def map_wordp_headers(row):
+    mapped: dict[str, int] = {}
+    normalized = [normalize_wordp_header(cell) for cell in row]
+    for key, aliases in WORDP_HEADER_ALIASES.items():
+        alias_values = {normalize_wordp_header(alias) for alias in aliases}
+        for index, value in enumerate(normalized):
+            if value in alias_values and key not in mapped:
+                mapped[key] = index
+    return mapped
+
+
+def find_wordp_testcase_sheet(workbook):
+    sheets = sorted(workbook.worksheets, key=lambda ws: 0 if ws.title.lower() == "testcase" else 1)
+    for ws in sheets:
+        max_scan = min(ws.max_row, 10)
+        for row_number, row in enumerate(
+            ws.iter_rows(min_row=1, max_row=max_scan, values_only=True),
+            start=1,
+        ):
+            mapped = map_wordp_headers(row)
+            if {"case_no", "item", "expected"}.issubset(mapped):
+                return ws, row_number, mapped
+    return None, 0, {}
+
+
+def wordp_cell(row, header_map, key):
+    index = header_map.get(key)
+    if index is None or index >= len(row):
+        return ""
+    return clean_manual_text(row[index])
+
+
+def wordp_description(case_no, major, middle, feature, item):
+    category = " > ".join(part for part in [major, middle, feature] if part)
+    summary = re.sub(r"\s+", " ", str(item or "")).strip()
+    if len(summary) > 70:
+        summary = summary[:67] + "..."
+    prefix = str(case_no or "WordP").strip()
+    return f"{prefix} [{category or 'WordP TestCase'}] {summary}"
+
+
+def wordp_text_has_any(text, patterns):
+    source = str(text or "").lower()
+    return any(str(pattern).lower() in source for pattern in patterns)
+
+
+def should_block_wordp_case(item, expected, precondition):
+    text = " ".join(str(value or "") for value in [item, expected, precondition])
+    if str(item or "").strip().lower() in {"p", "n/a", "na", "-"}:
+        return "WordP TestCase row has no actionable test item."
+    if "해당하는 위치" in str(item or "") or "다른 곳" in str(item or ""):
+        return "WordP TestCase has no clear clickable label."
+    for pattern in WORDP_BLOCK_PATTERNS:
+        if str(pattern).lower() in text.lower():
+            return f"WordP TestCase needs manual/environment control: {pattern}"
+    return ""
+
+
+def extract_wordp_input_value(item):
+    text = str(item or "")
+    quoted = re.findall(r'"([^"]+)"', text) + re.findall(r"'([^']+)'", text)
+    for value in quoted:
+        value = strip_action_label(value)
+        if value:
+            return value
+    return ""
+
+
+def extract_wordp_action_label(item, major="", middle="", feature=""):
+    text = re.sub(r"\s+", " ", str(item or "")).strip()
+    quoted = re.findall(r'"([^"]+)"', text) + re.findall(r"'([^']+)'", text)
+    bracketed = re.findall(r"[\[\(]([^\]\)]+)[\]\)]", text)
+    for value in [*quoted, *bracketed]:
+        label = strip_action_label(value)
+        if label and label not in WORDP_GENERIC_LABELS:
+            return label
+
+    for label in WORDP_ACTION_LABELS:
+        if label in text:
+            return label
+
+    patterns = [
+        r"([가-힣A-Za-z0-9\s]+?)\s*버튼",
+        r"([가-힣A-Za-z0-9\s]+?)(?:을|를)\s*선택",
+        r"([가-힣A-Za-z0-9\s]+?)(?:을|를)\s*터치",
+        r"([가-힣A-Za-z0-9\s]+?)(?:을|를)\s*클릭",
+        r"([가-힣A-Za-z0-9\s]+?)(?:을|를)\s*누른다",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            label = strip_action_label(match.group(1))
+            label = re.sub(r"^(다시|해당하는|원하는)\s+", "", label).strip()
+            if 1 <= len(label) <= 24 and label not in WORDP_GENERIC_LABELS:
+                return label
+
+    for fallback in [feature, middle, major]:
+        label = strip_action_label(fallback)
+        if label and len(label) <= 24 and label not in WORDP_GENERIC_LABELS:
+            return label
+    return ""
+
+
+def wordp_expected_candidates(expected):
+    text = re.sub(r"\s+", " ", str(expected or "")).strip()
+    if not text:
+        return []
+
+    candidates: list[str] = []
+    candidates.extend(strip_action_label(value) for value in re.findall(r'"([^"]+)"', text))
+    parts = re.split(r"[\n\r\-.]+", text)
+    for part in parts:
+        part = strip_action_label(part)
+        if not part:
+            continue
+        cleaned = re.sub(r"(화면|메시지|Toast).*$", r"\1", part).strip()
+        cleaned = re.sub(r"(으로|로)?\s*(이동|노출|표시|생성|저장|변경).*$", "", cleaned).strip()
+        cleaned = re.sub(r"(이|가|은|는|을|를)$", "", cleaned).strip()
+        for value in [cleaned, part]:
+            value = strip_action_label(value)
+            if 2 <= len(value) <= 40 and value not in candidates:
+                candidates.append(value)
+    return candidates[:6]
+
+
+def parse_wordp_testcase_excel(workbook):
+    ws, header_row, header_map = find_wordp_testcase_sheet(workbook)
+    if ws is None:
+        return None
+
+    steps: list[dict[str, Any]] = []
+    for row_number, row in enumerate(
+        ws.iter_rows(min_row=header_row + 1, values_only=True),
+        start=header_row + 1,
+    ):
+        case_no = wordp_cell(row, header_map, "case_no")
+        major = wordp_cell(row, header_map, "major")
+        middle = wordp_cell(row, header_map, "middle")
+        feature = wordp_cell(row, header_map, "feature")
+        precondition = wordp_cell(row, header_map, "precondition")
+        item = wordp_cell(row, header_map, "item")
+        expected = wordp_cell(row, header_map, "expected")
+        result = wordp_cell(row, header_map, "result")
+        if not any([case_no, major, middle, feature, precondition, item, expected]):
+            continue
+
+        assert_candidates = wordp_expected_candidates(expected)
+        common = {
+            "row": row_number,
+            "step": len(steps) + 1,
+            "source": "wordp_testcase",
+            "case_no": case_no,
+            "major": major,
+            "middle": middle,
+            "feature": feature,
+            "precondition": precondition,
+            "test_item": item,
+            "qa_expected": expected,
+            "qa_result": result,
+            "description": wordp_description(case_no, major, middle, feature, item),
+            "value": "",
+            "expected": expected,
+            "assert_candidates": assert_candidates,
+            "x": "",
+            "y": "",
+            "x1": "",
+            "y1": "",
+            "x2": "",
+            "y2": "",
+            "duration_ms": "",
+            "wait_ms": "",
+            "delay_ms": "",
+            "screen_width": "",
+            "screen_height": "",
+        }
+
+        block_reason = should_block_wordp_case(item, expected, precondition)
+        if block_reason:
+            steps.append({**common, "action": "blocked", "target": "", "block_reason": block_reason})
+            continue
+
+        if wordp_text_has_any(item, WORDP_SWIPE_WORDS):
+            steps.append({**common, "action": "swipe", "target": "", "duration_ms": 450})
+            continue
+
+        if wordp_text_has_any(item, WORDP_INPUT_WORDS):
+            value = extract_wordp_input_value(item)
+            if value:
+                steps.append({**common, "action": "input", "target": "", "value": value})
+            else:
+                steps.append(
+                    {
+                        **common,
+                        "action": "blocked",
+                        "target": "",
+                        "block_reason": "WordP TestCase input value is not explicit.",
+                    }
+                )
+            continue
+
+        if wordp_text_has_any(item, WORDP_TAP_WORDS):
+            target = extract_wordp_action_label(item, major, middle, feature)
+            if target:
+                steps.append({**common, "action": "tap", "target": target})
+            else:
+                steps.append(
+                    {
+                        **common,
+                        "action": "blocked",
+                        "target": "",
+                        "block_reason": "WordP TestCase has no clear clickable label.",
+                    }
+                )
+            continue
+
+        if assert_candidates:
+            steps.append({**common, "action": "assert_text", "target": assert_candidates[0]})
+            continue
+
+        steps.append(
+            {
+                **common,
+                "action": "blocked",
+                "target": "",
+                "block_reason": "WordP TestCase sentence is ambiguous for automation.",
+            }
+        )
+
+    if not steps:
+        raise ValueError("WordP TestCase Excel was detected, but no executable rows were found.")
+    return steps
+
+
 def parse_excel(file_storage):
     try:
         from openpyxl import load_workbook
@@ -517,6 +823,9 @@ def parse_excel(file_storage):
     manual_qa_steps = parse_manual_qa_excel(wb)
     if manual_qa_steps is not None:
         return manual_qa_steps
+    wordp_steps = parse_wordp_testcase_excel(wb)
+    if wordp_steps is not None:
+        return wordp_steps
 
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -683,6 +992,8 @@ def testcase_source(steps):
         return "recorder"
     if steps and all(step.get("source") == "manual_qa" for step in steps):
         return "manual_qa"
+    if steps and all(step.get("source") == "wordp_testcase" for step in steps):
+        return "wordp_testcase"
     return "testcase"
 
 
@@ -706,6 +1017,93 @@ def capture_screen_hash():
     if rc != 0 or len(raw) < 100:
         return ""
     return hashlib.sha1(raw).hexdigest()
+
+
+def capture_screen_png():
+    raw, err, rc = adb("exec-out", "screencap", "-p", timeout_s=8)
+    if rc != 0 or len(raw) < 100:
+        raise RuntimeError(err.decode(errors="ignore") or "screencap failed")
+    return raw
+
+
+def ocr_status_payload():
+    with _ocr_lock:
+        data = dict(_ocr_status)
+        data["installed"] = importlib.util.find_spec("easyocr") is not None
+        data["languages"] = list(OCR_LANGS)
+        return data
+
+
+def get_ocr_reader():
+    global _ocr_reader
+
+    with _ocr_lock:
+        if _ocr_reader is not None:
+            _ocr_status.update({"available": True, "state": "ready", "message": "OCR ready"})
+            return _ocr_reader
+        if _ocr_status.get("available") is False:
+            return None
+
+        _ocr_status.update({"available": None, "state": "loading", "message": "Loading EasyOCR"})
+        try:
+            import easyocr
+
+            _ocr_reader = easyocr.Reader(OCR_LANGS, gpu=False, verbose=False)
+            _ocr_status.update({"available": True, "state": "ready", "message": "OCR ready"})
+            return _ocr_reader
+        except Exception as exc:
+            _ocr_status.update(
+                {
+                    "available": False,
+                    "state": "unavailable",
+                    "message": f"EasyOCR unavailable: {exc}",
+                }
+            )
+            return None
+
+
+def ocr_screen_texts():
+    reader = get_ocr_reader()
+    if reader is None:
+        return []
+
+    try:
+        import numpy as np
+        from PIL import Image
+
+        raw = capture_screen_png()
+        image = np.array(Image.open(io.BytesIO(raw)).convert("RGB"))
+        results = reader.readtext(image, detail=1, paragraph=False)
+    except Exception as exc:
+        with _ocr_lock:
+            _ocr_status.update({"available": False, "state": "unavailable", "message": f"OCR failed: {exc}"})
+        return []
+
+    items: list[dict[str, Any]] = []
+    for result in results:
+        if len(result) < 3:
+            continue
+        box, text, confidence = result[0], str(result[1] or "").strip(), float(result[2] or 0)
+        if not text or confidence < OCR_MIN_CONFIDENCE:
+            continue
+        try:
+            xs = [int(round(point[0])) for point in box]
+            ys = [int(round(point[1])) for point in box]
+        except Exception:
+            continue
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        items.append(
+            {
+                "text": text,
+                "confidence": round(confidence, 3),
+                "bounds": [x1, y1, x2, y2],
+                "center": {"x": (x1 + x2) // 2, "y": (y1 + y2) // 2},
+            }
+        )
+
+    with _ocr_lock:
+        _ocr_status.update({"available": True, "state": "ready", "message": f"OCR ready: {len(items)} texts"})
+    return items
 
 
 def wait_for_screen_change(before_hash, timeout_s=5.0, stop_event=None):
@@ -751,6 +1149,10 @@ def parse_bounds(bounds):
 def text_candidates_from_step(step):
     candidates: list[str] = []
 
+    extra_candidates = step.get("assert_candidates") or []
+    if isinstance(extra_candidates, list):
+        candidates.extend(str(value).strip() for value in extra_candidates if str(value or "").strip())
+
     for key in ("target", "value", "expected"):
         value = str(step.get(key) or "").strip()
         if value and not looks_like_point(value) and not re.fullmatch(r"\d+(\.\d+)?", value):
@@ -771,14 +1173,47 @@ def text_candidates_from_step(step):
             unique.append(candidate)
     return unique
 
+
+def text_value_matches(candidate, value):
+    candidate = str(candidate or "").strip()
+    value = str(value or "").strip()
+    if not candidate or not value:
+        return False
+    candidate_lower = candidate.lower()
+    value_lower = value.lower()
+    compact_candidate = re.sub(r"\s+", "", candidate_lower)
+    compact_value = re.sub(r"\s+", "", value_lower)
+    return candidate_lower in value_lower or compact_candidate in compact_value
+
+
+def find_ocr_text_center(candidates):
+    useful = [str(candidate or "").strip() for candidate in candidates if str(candidate or "").strip()]
+    if not useful:
+        return None
+
+    for item in ocr_screen_texts():
+        text = item.get("text", "")
+        for candidate in useful:
+            if text_value_matches(candidate, text):
+                center = item.get("center") or {}
+                return {
+                    "x": int(center.get("x", 0)),
+                    "y": int(center.get("y", 0)),
+                    "text": text,
+                    "candidate": candidate,
+                    "source": "ocr",
+                    "confidence": item.get("confidence", 0),
+                }
+    return None
+
+
 def find_ui_text_center(candidates):
     xml = dump_ui_xml()
     if not xml:
-        return None
+        return find_ocr_text_center(candidates)
 
     nodes = re.findall(r"<node\b[^>]*>", xml)
     for candidate in candidates:
-        compact_candidate = candidate.replace(" ", "")
         for node in nodes:
             attrs = node_attrs(node)
             values = [
@@ -787,10 +1222,7 @@ def find_ui_text_center(candidates):
                 attrs.get("resource-id", ""),
             ]
             for value in values:
-                if not value:
-                    continue
-                compact_value = value.replace(" ", "")
-                if candidate in value or compact_candidate in compact_value:
+                if text_value_matches(candidate, value):
                     bounds = parse_bounds(attrs.get("bounds", ""))
                     if bounds:
                         x1, y1, x2, y2 = bounds
@@ -800,7 +1232,7 @@ def find_ui_text_center(candidates):
                             "text": value,
                             "candidate": candidate,
                         }
-    return None
+    return find_ocr_text_center(candidates)
 
 
 def allows_unchanged_after_tap(step, text_hit):
@@ -818,8 +1250,12 @@ def ui_contains(text):
 
 def wait_until_ui_contains(text, timeout_s=5.0, should_exist=True):
     deadline = time.time() + timeout_s
+    next_ocr_at = 0.0
     while time.time() < deadline:
         found = ui_contains(text)
+        if should_exist and not found and time.time() >= next_ocr_at:
+            found = find_ocr_text_center([text]) is not None
+            next_ocr_at = time.time() + 1.0
         if found == should_exist:
             return True
         time.sleep(0.35)
@@ -829,6 +1265,7 @@ def wait_until_ui_contains(text, timeout_s=5.0, should_exist=True):
 def wait_until_any_ui_contains(candidates, timeout_s=5.0):
     deadline = time.time() + timeout_s
     useful = [candidate for candidate in candidates if candidate]
+    next_ocr_at = 0.0
     while time.time() < deadline:
         xml = dump_ui_xml()
         if xml:
@@ -837,6 +1274,11 @@ def wait_until_any_ui_contains(candidates, timeout_s=5.0):
                 compact_candidate = candidate.replace(" ", "")
                 if candidate in xml or compact_candidate in compact_xml:
                     return candidate
+        if time.time() >= next_ocr_at:
+            hit = find_ocr_text_center(useful)
+            if hit:
+                return hit.get("candidate") or hit.get("text") or ""
+            next_ocr_at = time.time() + 1.0
         time.sleep(0.35)
     return ""
 
@@ -1038,6 +1480,57 @@ def analyze_ui_candidates():
     return candidates, xml
 
 
+def build_ocr_candidates():
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for index, item in enumerate(ocr_screen_texts(), start=1):
+        label = normalize_ui_label(item.get("text", ""))
+        if not label:
+            continue
+        compact_label = re.sub(r"\s+", "", label.lower())
+        if compact_label in seen:
+            continue
+        seen.add(compact_label)
+
+        bounds = item.get("bounds") or []
+        center = item.get("center") or {}
+        if len(bounds) != 4 or not center:
+            continue
+        x1, y1, x2, y2 = [int(value) for value in bounds]
+        bounds_text = f"[{x1},{y1}][{x2},{y2}]"
+        x, y = int(center["x"]), int(center["y"])
+        confidence = float(item.get("confidence") or 0)
+        score = 8 + min(4, int(confidence * 4))
+
+        step = {
+            "action": "tap",
+            "target": label,
+            "description": f"OCR text: {label}",
+            "x": x,
+            "y": y,
+        }
+        candidates.append(
+            {
+                "node_index": f"ocr-{index}",
+                "label": label,
+                "class": "ocr-text",
+                "package": "",
+                "bounds": bounds_text,
+                "x": x,
+                "y": y,
+                "action": "tap",
+                "score": score,
+                "source": "ocr-text",
+                "selected": False,
+                "step": step,
+                "confidence": confidence,
+            }
+        )
+
+    return candidates
+
+
 def point_in_bounds(x, y, bounds):
     parsed = parse_bounds(bounds)
     if not parsed:
@@ -1134,8 +1627,10 @@ def build_memory_candidates(memory_actions, ui_candidates):
 
 def build_random_plan(max_steps=10, memory_actions=None):
     candidates, _ = analyze_ui_candidates()
-    memory_candidates = build_memory_candidates(memory_actions or [], candidates)
-    combined_candidates = [*candidates, *memory_candidates]
+    ocr_candidates = build_ocr_candidates()
+    analysis_candidates = [*candidates, *ocr_candidates]
+    memory_candidates = build_memory_candidates(memory_actions or [], analysis_candidates)
+    combined_candidates = [*analysis_candidates, *memory_candidates]
     if not combined_candidates:
         return []
 
@@ -1702,13 +2197,21 @@ def execute_step(step):
         if not changed:
             if step.get("source") == "recorder":
                 return f"Tapped {source} at ({x}, {y}); recorder step sent"
-            if step.get("source") == "manual_qa":
+            if step.get("source") in {"manual_qa", "wordp_testcase"}:
                 matched = wait_until_any_ui_contains(text_candidates_from_step(step), timeout_s=1.5)
                 if matched:
                     return f"Tapped {source} at ({x}, {y}); found '{matched}'"
             if text_hit and allows_unchanged_after_tap(step, text_hit):
                 return f"Tapped {source} at ({x}, {y}); screen already on target"
             raise AssertionError(f"Screen did not change after tap: {source}")
+
+        if step.get("source") == "wordp_testcase":
+            candidates = text_candidates_from_step(step)
+            if candidates:
+                matched = wait_until_any_ui_contains(candidates, timeout_s=2.0)
+                if not matched:
+                    raise AssertionError(f"Expected text not found after tap: {', '.join(candidates[:3])}")
+                return f"Tapped {source} at ({x}, {y}); found '{matched}'"
 
         description = str(step.get("description") or "")
         submit_keywords = ["submit", "quiz", "\uc81c\ucd9c", "\ud034\uc988"]
@@ -1734,7 +2237,16 @@ def execute_step(step):
         return f"Tapped {source} at ({x}, {y}); screen changed"
 
     if action == "swipe":
-        x1, y1, x2, y2 = parse_swipe(step)
+        if step.get("source") == "wordp_testcase" and not any(step.get(key) not in ("", None) for key in ("x1", "y1", "x2", "y2")):
+            current = current_device_resolution()
+            if not current:
+                raise RuntimeError("Could not read current device resolution for WordP swipe.")
+            width, height = current
+            x1 = x2 = width // 2
+            y1 = int(height * 0.70)
+            y2 = int(height * 0.35)
+        else:
+            x1, y1, x2, y2 = parse_swipe(step)
         duration = int_value(step.get("duration_ms"), 400)
         _, err, rc = adb("shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration))
         if rc:
@@ -1771,7 +2283,7 @@ def execute_step(step):
         expected = step.get("expected") or step.get("value") or step.get("target")
         if not expected:
             raise ValueError("assert_text action needs expected/value/target.")
-        if step.get("source") == "manual_qa":
+        if step.get("source") in {"manual_qa", "wordp_testcase"}:
             matched = wait_until_any_ui_contains(text_candidates_from_step(step), timeout_s=5.0)
             if not matched:
                 raise AssertionError(f"Text not found: {expected}")
@@ -2714,6 +3226,7 @@ HTML = r"""
               <input id="random-delay" type="number" min="0" max="10000" step="100" value="800">
             </div>
             <div class="random-memory-state" id="random-memory-state">Memory: 0 actions</div>
+            <div class="random-memory-state" id="ocr-state">OCR: Idle</div>
             <div class="random-actions">
               <button class="btn-random-dry" id="btn-random-memory" type="button" onclick="toggleRandomMemory()"><span class="ui-icon icon-dry" aria-hidden="true"></span><span id="random-memory-label">Memory</span></button>
               <button class="btn-random-live" id="btn-random-live" type="button" onclick="runRandom()"><span class="ui-icon icon-live" aria-hidden="true"></span>Live Run</button>
@@ -2841,6 +3354,7 @@ HTML = r"""
     const randomMemoryButton = document.getElementById('btn-random-memory');
     const randomMemoryLabel = document.getElementById('random-memory-label');
     const randomMemoryState = document.getElementById('random-memory-state');
+    const ocrState = document.getElementById('ocr-state');
     const randomMemoryClearButton = document.getElementById('btn-random-memory-clear');
     const randomLiveButton = document.getElementById('btn-random-live');
     const randomStopButton = document.getElementById('btn-random-stop');
@@ -2902,6 +3416,7 @@ HTML = r"""
       loadCurrentTestCase();
       refreshDeviceInfo();
       refreshRecordings();
+      refreshOcrStatus();
     });
 
     socket.on('disconnect', () => {
@@ -2984,6 +3499,7 @@ HTML = r"""
       resetProgressState();
       setProgressFilter('passed');
       setRandomRunning(true);
+      refreshOcrStatus();
     });
 
     socket.on('random_progress', (data) => {
@@ -2995,6 +3511,7 @@ HTML = r"""
       statusLabel.textContent = data.msg || 'Random explorer error';
       randomState.textContent = 'Error';
       setRandomRunning(false);
+      refreshOcrStatus();
     });
 
     socket.on('random_run_finished', (data) => {
@@ -3012,6 +3529,7 @@ HTML = r"""
         : `${done} / ${data.total} - ${data.passed} passed / ${data.failed} failed / 0 blocked`;
       randomState.textContent = 'Idle';
       setRandomRunning(false);
+      refreshOcrStatus();
     });
 
     setupProgressResize();
@@ -3035,6 +3553,28 @@ HTML = r"""
         renderDeviceInfo(data);
       } catch (error) {
         renderDeviceInfo({ connected: false });
+      }
+    }
+
+    async function refreshOcrStatus() {
+      try {
+        const response = await fetch('/api/ocr/status');
+        const data = await response.json();
+        const state = data.state || 'idle';
+        let label = 'OCR: Idle';
+        if (state === 'ready') {
+          label = 'OCR: Ready';
+        } else if (state === 'loading') {
+          label = 'OCR: Loading';
+        } else if (state === 'unavailable' || data.available === false || data.installed === false) {
+          label = 'OCR: Unavailable';
+        }
+        ocrState.textContent = label;
+        ocrState.title = data.message || '';
+        ocrState.classList.toggle('active', data.available === true || state === 'ready');
+      } catch (error) {
+        ocrState.textContent = 'OCR: Unknown';
+        ocrState.classList.remove('active');
       }
     }
 
@@ -3092,6 +3632,8 @@ HTML = r"""
         ? `Loaded Recorder Excel: ${loadedSteps.length} steps`
         : data.source === 'manual_qa'
           ? `Loaded Manual QA Excel: ${loadedSteps.length} cases`
+          : data.source === 'wordp_testcase'
+            ? `Loaded WordP TestCase: ${loadedSteps.length} cases`
           : `Loaded ${loadedSteps.length} steps`;
       runSummary.textContent = 'Ready';
     }
@@ -3472,6 +4014,7 @@ HTML = r"""
       });
       if (tabName === 'random-test') {
         syncRandomControls();
+        refreshOcrStatus();
         if (!isRandomRunning) {
           statusLabel.textContent = screen.naturalWidth && screen.naturalHeight
             ? 'Random Test ready'
@@ -4073,6 +4616,11 @@ def favicon():
 @app.route("/api/device")
 def device_info():
     return jsonify(get_device_info())
+
+
+@app.route("/api/ocr/status")
+def ocr_status():
+    return jsonify(ocr_status_payload())
 
 
 @app.route("/api/results/screenshot/<path:filename>")
