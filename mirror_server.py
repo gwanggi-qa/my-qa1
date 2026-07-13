@@ -10,11 +10,15 @@ import html as html_lib
 import importlib.util
 import io
 import json
+import os
 import random
 import re
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,8 +34,13 @@ ADB_SERIAL = ""
 BASE_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = BASE_DIR / "recordings"
 QA_RESULTS_DIR = BASE_DIR / "qa_results"
+AI_HISTORY_FILE = QA_RESULTS_DIR / "ai_random_history.jsonl"
 OCR_LANGS = ["ko", "en"]
 OCR_MIN_CONFIDENCE = 0.35
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/responses").strip()
+AI_REQUEST_TIMEOUT_S = 45
+AI_HISTORY_LIMIT = 20
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "tablet-mirror-secret"
@@ -48,6 +57,7 @@ _random_lock = threading.Lock()
 _random_running = False
 _random_stop_event = threading.Event()
 _random_last_plan: list[dict[str, Any]] = []
+_ai_history_lock = threading.Lock()
 _record_play_lock = threading.Lock()
 _record_play_running = False
 _record_play_stop_event = threading.Event()
@@ -1034,6 +1044,20 @@ def ocr_status_payload():
         return data
 
 
+def ai_status_payload():
+    configured = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    return {
+        "configured": configured,
+        "state": "ready" if configured else "unavailable",
+        "model": OPENAI_MODEL,
+        "message": (
+            f"AI planner ready: {OPENAI_MODEL}"
+            if configured
+            else "Set OPENAI_API_KEY before starting the server. AI Run will use Live Run fallback until configured."
+        ),
+    }
+
+
 def get_ocr_reader():
     global _ocr_reader
 
@@ -1625,12 +1649,19 @@ def build_memory_candidates(memory_actions, ui_candidates):
     return candidates
 
 
-def build_random_plan(max_steps=10, memory_actions=None):
+def collect_random_candidates(memory_actions=None):
     candidates, _ = analyze_ui_candidates()
     ocr_candidates = build_ocr_candidates()
     analysis_candidates = [*candidates, *ocr_candidates]
     memory_candidates = build_memory_candidates(memory_actions or [], analysis_candidates)
-    combined_candidates = [*analysis_candidates, *memory_candidates]
+    combined_candidates = [*memory_candidates, *analysis_candidates]
+    for index, candidate in enumerate(combined_candidates, start=1):
+        candidate["candidate_id"] = f"c{index:03d}"
+    return combined_candidates
+
+
+def build_random_plan(max_steps=10, memory_actions=None):
+    combined_candidates = collect_random_candidates(memory_actions)
     if not combined_candidates:
         return []
 
@@ -1655,6 +1686,227 @@ def build_random_plan(max_steps=10, memory_actions=None):
             }
         )
     return planned
+
+
+AI_RISKY_LABELS = (
+    "purchase",
+    "payment",
+    "buy now",
+    "delete account",
+    "factory reset",
+    "uninstall",
+    "결제",
+    "구매",
+    "탈퇴",
+    "계정 삭제",
+    "초기화",
+    "앱 삭제",
+)
+
+
+def ai_candidate_is_safe(candidate):
+    if candidate.get("action") not in {"tap", "swipe"}:
+        return False
+    label = str(candidate.get("label") or "").casefold()
+    if any(keyword.casefold() in label for keyword in AI_RISKY_LABELS):
+        return False
+    if label == "(no label)" and candidate.get("source") not in {
+        "functional-memory",
+        "nonfunctional-memory",
+    }:
+        return False
+    return True
+
+
+def load_ai_random_history(limit=AI_HISTORY_LIMIT):
+    if not AI_HISTORY_FILE.exists():
+        return []
+    try:
+        lines = AI_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    history: list[dict[str, Any]] = []
+    for line in lines[-max(1, limit):]:
+        try:
+            item = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(item, dict):
+            history.append(item)
+    return history
+
+
+def append_ai_random_history(record):
+    QA_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with _ai_history_lock:
+        with AI_HISTORY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+
+def ai_uploaded_test_context(limit=40):
+    items: list[dict[str, str]] = []
+    for step in _test_steps[:limit]:
+        items.append(
+            {
+                "action": str(step.get("action") or ""),
+                "target": str(step.get("target") or "")[:160],
+                "description": str(step.get("description") or "")[:240],
+                "expected": str(step.get("expected") or "")[:160],
+            }
+        )
+    return items
+
+
+def extract_openai_output_text(response_data):
+    direct = response_data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    parts: list[str] = []
+    for output_item in response_data.get("output") or []:
+        if not isinstance(output_item, dict):
+            continue
+        for content_item in output_item.get("content") or []:
+            if not isinstance(content_item, dict):
+                continue
+            text = content_item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def parse_ai_plan_json(text):
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    data = json.loads(cleaned)
+    if not isinstance(data, dict) or not isinstance(data.get("steps"), list):
+        raise ValueError("AI planner response does not contain a steps list.")
+    return data
+
+
+def request_ai_random_plan(context):
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    instructions = (
+        "You are a cautious Android QA planner. Select only candidate_id values provided by the user. "
+        "Plan the requested number of actions, favoring feature coverage, unseen paths, prior failures, "
+        "uploaded test-case intent, and memory actions. Never invent coordinates or actions. Avoid purchases, "
+        "account deletion, uninstall, factory reset, system settings, permissions, and other destructive flows. "
+        "Return only a JSON object with summary and steps. Each step must have candidate_id and a short reason."
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+        "max_output_tokens": 2400,
+    }
+    http_request = urllib.request.Request(
+        OPENAI_API_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(http_request, timeout=AI_REQUEST_TIMEOUT_S) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        message = f"OpenAI API returned HTTP {exc.code}"
+        try:
+            error_data = json.loads(exc.read().decode("utf-8", errors="ignore"))
+            detail = str((error_data.get("error") or {}).get("message") or "").strip()
+            if detail:
+                message = f"{message}: {detail[:300]}"
+        except (TypeError, ValueError):
+            pass
+        raise RuntimeError(message) from exc
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
+
+    output_text = extract_openai_output_text(response_data)
+    if not output_text:
+        raise RuntimeError("OpenAI API returned no planner output")
+    return parse_ai_plan_json(output_text), response_data.get("usage") or {}
+
+
+def build_ai_random_plan(max_steps=10, memory_actions=None):
+    combined_candidates = collect_random_candidates(memory_actions)
+    safe_candidates = [candidate for candidate in combined_candidates if ai_candidate_is_safe(candidate)]
+    if not safe_candidates:
+        raise RuntimeError("No safe UI candidates found for AI planning")
+
+    candidate_context = []
+    for candidate in safe_candidates[:100]:
+        candidate_context.append(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "label": str(candidate.get("label") or "")[:160],
+                "action": candidate.get("action"),
+                "source": candidate.get("source"),
+                "bounds": candidate.get("bounds"),
+                "score": candidate.get("score"),
+                "selected": bool(candidate.get("selected")),
+            }
+        )
+
+    context = {
+        "requested_steps": max_steps,
+        "candidates": candidate_context,
+        "uploaded_test_cases": ai_uploaded_test_context(),
+        "recent_runs": load_ai_random_history(),
+        "response_schema": {
+            "summary": "short planning summary",
+            "steps": [{"candidate_id": "c001", "reason": "short reason"}],
+        },
+    }
+    ai_response, usage = request_ai_random_plan(context)
+    candidate_map = {candidate["candidate_id"]: candidate for candidate in safe_candidates}
+    selected: list[tuple[dict[str, Any], str]] = []
+    for item in ai_response.get("steps") or []:
+        if not isinstance(item, dict):
+            continue
+        candidate = candidate_map.get(str(item.get("candidate_id") or ""))
+        if not candidate:
+            continue
+        selected.append((candidate, str(item.get("reason") or "AI selected candidate")[:200]))
+        if len(selected) >= max_steps:
+            break
+    if not selected:
+        raise RuntimeError("AI planner did not select any valid candidates")
+
+    planned: list[dict[str, Any]] = []
+    for index in range(max_steps):
+        candidate, reason = selected[index % len(selected)]
+        planned_candidate = dict(candidate)
+        planned_candidate["original_source"] = candidate.get("source", "ui-analysis")
+        planned_candidate["source"] = "ai-planner"
+        planned_candidate["ai_reason"] = reason
+        step = dict(candidate["step"])
+        step["description"] = f"ai-planner: {candidate['label']}"
+        planned.append(
+            {
+                "index": index + 1,
+                "candidate": planned_candidate,
+                "step": step,
+                "risk": "medium",
+                "verify": f"ai-planner ({planned_candidate['original_source']}) + screen-change + error scan",
+            }
+        )
+    return planned, {
+        "model": OPENAI_MODEL,
+        "summary": str(ai_response.get("summary") or "AI plan created")[:400],
+        "candidate_count": len(safe_candidates),
+        "usage": usage,
+        "fallback": False,
+    }
 
 
 def detect_runtime_errors():
@@ -2066,21 +2318,66 @@ def random_sleep_with_stop(delay_ms):
     return random_stop_requested()
 
 
-def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_actions=None):
+def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_actions=None, ai_mode=False):
     global _random_running, _random_last_plan
 
     passed = 0
     failed = 0
     stopped = 0
     total = max_steps
-    mode = "dry-run" if dry_run else "live"
+    mode = "ai" if ai_mode else ("dry-run" if dry_run else "live")
+    run_id = uuid.uuid4().hex
+    ai_meta: dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "summary": "",
+        "fallback": False,
+    }
+    run_results: list[dict[str, Any]] = []
 
     try:
         if not check_device():
             raise RuntimeError("No adb device. Check USB connection and USB debugging.")
 
         emit_random_started(total, mode)
-        plan = build_random_plan(max_steps=max_steps, memory_actions=memory_actions or [])
+        if ai_mode:
+            socketio.emit(
+                "random_ai_status",
+                {"state": "planning", "message": f"AI planning {total} steps with {OPENAI_MODEL}"},
+                namespace="/mirror",
+            )
+            try:
+                plan, ai_meta = build_ai_random_plan(
+                    max_steps=max_steps,
+                    memory_actions=memory_actions or [],
+                )
+                socketio.emit(
+                    "random_ai_status",
+                    {"state": "ready", "message": ai_meta["summary"], "model": OPENAI_MODEL},
+                    namespace="/mirror",
+                )
+            except Exception as exc:
+                ai_meta = {
+                    "model": OPENAI_MODEL,
+                    "summary": str(exc),
+                    "fallback": True,
+                }
+                socketio.emit(
+                    "random_ai_status",
+                    {
+                        "state": "fallback",
+                        "message": f"AI unavailable; using Live Run fallback: {exc}",
+                        "model": OPENAI_MODEL,
+                    },
+                    namespace="/mirror",
+                )
+                plan = build_random_plan(max_steps=max_steps, memory_actions=memory_actions or [])
+                for plan_item in plan:
+                    candidate = plan_item["candidate"]
+                    candidate["original_source"] = candidate.get("source", "ui-analysis")
+                    candidate["source"] = "ai-fallback"
+                    plan_item["verify"] = "ai-fallback + screen-change + error scan"
+        else:
+            plan = build_random_plan(max_steps=max_steps, memory_actions=memory_actions or [])
         _random_last_plan = plan
 
         if not plan:
@@ -2119,6 +2416,16 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                         raise RandomStopped("Random run stopped")
 
                 passed += 1
+                run_results.append(
+                    {
+                        "index": index,
+                        "status": "passed",
+                        "action": step.get("action"),
+                        "label": plan_item["candidate"].get("label"),
+                        "source": plan_item["candidate"].get("source"),
+                        "reason": plan_item["candidate"].get("ai_reason", ""),
+                    }
+                )
                 emit_random_progress(
                     index,
                     total,
@@ -2129,6 +2436,16 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                 )
             except RandomStopped as exc:
                 stopped += 1
+                run_results.append(
+                    {
+                        "index": index,
+                        "status": "stopped",
+                        "action": step.get("action"),
+                        "label": plan_item["candidate"].get("label"),
+                        "source": plan_item["candidate"].get("source"),
+                        "message": str(exc)[:300],
+                    }
+                )
                 emit_random_progress(
                     index,
                     total,
@@ -2140,6 +2457,17 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                 break
             except Exception as exc:
                 failed += 1
+                run_results.append(
+                    {
+                        "index": index,
+                        "status": "failed",
+                        "action": step.get("action"),
+                        "label": plan_item["candidate"].get("label"),
+                        "source": plan_item["candidate"].get("source"),
+                        "reason": plan_item["candidate"].get("ai_reason", ""),
+                        "message": str(exc)[:300],
+                    }
+                )
                 extra = failure_extra(
                     "random",
                     index,
@@ -2156,6 +2484,25 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
     except Exception as exc:
         socketio.emit("random_error", {"msg": str(exc)}, namespace="/mirror")
     finally:
+        if ai_mode:
+            try:
+                append_ai_random_history(
+                    {
+                        "run_id": run_id,
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "model": ai_meta.get("model", OPENAI_MODEL),
+                        "summary": ai_meta.get("summary", ""),
+                        "fallback": bool(ai_meta.get("fallback")),
+                        "requested_steps": total,
+                        "passed": passed,
+                        "failed": failed,
+                        "stopped": stopped,
+                        "uploaded_test_cases": len(_test_steps),
+                        "results": run_results,
+                    }
+                )
+            except OSError:
+                pass
         with _random_lock:
             _random_running = False
             _random_stop_event.clear()
@@ -2167,6 +2514,8 @@ def run_random_exploration(max_steps=20, delay_ms=800, dry_run=False, memory_act
                 "failed": failed,
                 "stopped": stopped,
                 "mode": mode,
+                "ai_model": ai_meta.get("model") if ai_mode else None,
+                "ai_fallback": bool(ai_meta.get("fallback")) if ai_mode else False,
                 "finished_at": time.strftime("%H:%M:%S"),
             },
             namespace="/mirror",
@@ -2611,6 +2960,7 @@ HTML = r"""
     .btn-random-dry { background: #6b7280; }
     .btn-random-dry.active { background: var(--accent); }
     .btn-random-live { background: #ad6b2d; }
+    .btn-random-ai { background: #355bc1; }
     .btn-random-stop { background: #8f3d56; }
     .btn-record { background: #b2554a; }
     .btn-save { background: var(--blue); }
@@ -2642,6 +2992,7 @@ HTML = r"""
     .icon-play::before { content: ">"; }
     .icon-dry::before { content: "M"; }
     .icon-live::before { content: ">"; }
+    .icon-ai::before { content: "AI"; font-size: 10px; }
     .icon-record::before { content: "o"; }
     .icon-stop::before,
     .icon-stop-play::before { content: "s"; }
@@ -2763,7 +3114,7 @@ HTML = r"""
     .random-actions {
       display: grid;
       grid-column: 1 / -1;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 8px;
     }
 
@@ -3227,9 +3578,11 @@ HTML = r"""
             </div>
             <div class="random-memory-state" id="random-memory-state">Memory: 0 actions</div>
             <div class="random-memory-state" id="ocr-state">OCR: Idle</div>
+            <div class="random-memory-state" id="ai-state">AI: Checking</div>
             <div class="random-actions">
               <button class="btn-random-dry" id="btn-random-memory" type="button" onclick="toggleRandomMemory()"><span class="ui-icon icon-dry" aria-hidden="true"></span><span id="random-memory-label">Memory</span></button>
               <button class="btn-random-live" id="btn-random-live" type="button" onclick="runRandom()"><span class="ui-icon icon-live" aria-hidden="true"></span>Live Run</button>
+              <button class="btn-random-ai" id="btn-random-ai" type="button" onclick="runRandom(true)"><span class="ui-icon icon-ai" aria-hidden="true"></span>AI Random Run</button>
               <button class="btn-secondary" id="btn-random-memory-clear" type="button" onclick="clearRandomMemory()"><span class="ui-icon icon-clear" aria-hidden="true"></span>Clear</button>
               <button class="btn-random-stop" id="btn-random-stop" type="button" onclick="stopRandom()" disabled><span class="ui-icon icon-stop" aria-hidden="true"></span>Stop</button>
             </div>
@@ -3355,8 +3708,10 @@ HTML = r"""
     const randomMemoryLabel = document.getElementById('random-memory-label');
     const randomMemoryState = document.getElementById('random-memory-state');
     const ocrState = document.getElementById('ocr-state');
+    const aiState = document.getElementById('ai-state');
     const randomMemoryClearButton = document.getElementById('btn-random-memory-clear');
     const randomLiveButton = document.getElementById('btn-random-live');
+    const randomAiButton = document.getElementById('btn-random-ai');
     const randomStopButton = document.getElementById('btn-random-stop');
     const recordState = document.getElementById('record-state');
     const recordStartButton = document.getElementById('btn-record-start');
@@ -3417,6 +3772,7 @@ HTML = r"""
       refreshDeviceInfo();
       refreshRecordings();
       refreshOcrStatus();
+      refreshAiStatus();
     });
 
     socket.on('disconnect', () => {
@@ -3491,8 +3847,14 @@ HTML = r"""
       updateRecorderControls();
     });
 
+    function randomModeLabel(mode) {
+      if (mode === 'ai') return 'AI Random Run';
+      if (mode === 'dry-run') return 'Dry Run';
+      return 'Live Run';
+    }
+
     socket.on('random_run_started', (data) => {
-      const label = data.mode === 'dry-run' ? 'Dry Run' : 'Live Run';
+      const label = randomModeLabel(data.mode);
       statusLabel.textContent = `${label} random explorer`;
       randomState.textContent = label;
       runSummary.textContent = `0 / ${data.total}`;
@@ -3500,6 +3862,19 @@ HTML = r"""
       setProgressFilter('passed');
       setRandomRunning(true);
       refreshOcrStatus();
+    });
+
+    socket.on('random_ai_status', (data) => {
+      const state = data.state || 'unknown';
+      const model = data.model ? ` (${data.model})` : '';
+      aiState.textContent = state === 'planning'
+        ? `AI: Planning${model}`
+        : state === 'fallback'
+          ? 'AI: Fallback'
+          : `AI: Ready${model}`;
+      aiState.title = data.message || '';
+      aiState.classList.toggle('active', state === 'ready' || state === 'planning');
+      statusLabel.textContent = data.message || aiState.textContent;
     });
 
     socket.on('random_progress', (data) => {
@@ -3515,7 +3890,7 @@ HTML = r"""
     });
 
     socket.on('random_run_finished', (data) => {
-      const label = data.mode === 'dry-run' ? 'Dry Run' : 'Live Run';
+      const label = randomModeLabel(data.mode);
       const stopped = data.stopped || 0;
       const done = (data.passed || 0) + (data.failed || 0) + stopped;
       const hadError = randomState.textContent === 'Error' && done === 0;
@@ -3530,6 +3905,7 @@ HTML = r"""
       randomState.textContent = 'Idle';
       setRandomRunning(false);
       refreshOcrStatus();
+      refreshAiStatus();
     });
 
     setupProgressResize();
@@ -3575,6 +3951,21 @@ HTML = r"""
       } catch (error) {
         ocrState.textContent = 'OCR: Unknown';
         ocrState.classList.remove('active');
+      }
+    }
+
+    async function refreshAiStatus() {
+      try {
+        const response = await fetch('/api/ai/status');
+        const data = await response.json();
+        aiState.textContent = data.configured
+          ? `AI: Ready (${data.model})`
+          : 'AI: API key required';
+        aiState.title = data.message || '';
+        aiState.classList.toggle('active', Boolean(data.configured));
+      } catch (error) {
+        aiState.textContent = 'AI: Unknown';
+        aiState.classList.remove('active');
       }
     }
 
@@ -3738,24 +4129,28 @@ HTML = r"""
       randomMemoryButton.classList.toggle('active', isRandomMemoryActive);
       randomMemoryButton.disabled = isRandomRunning;
       randomLiveButton.disabled = isRandomRunning;
+      randomAiButton.disabled = isRandomRunning;
       randomMemoryClearButton.disabled = isRandomRunning || randomMemoryActions.length === 0;
       randomStopButton.disabled = !isRandomRunning;
       randomSteps.disabled = isRandomRunning;
       randomDelay.disabled = isRandomRunning;
     }
 
-    async function runRandom() {
+    async function runRandom(aiMode = false) {
       const steps = clampNumber(randomSteps.value, 1, 200, 10);
       const delayMs = clampNumber(randomDelay.value, 0, 10000, 800);
 
       setRandomRunning(true);
-      statusLabel.textContent = `Preparing live random run with ${randomMemoryActions.length} memory actions`;
+      const runLabel = aiMode ? 'AI Random Run' : 'Live Run';
+      statusLabel.textContent = `Preparing ${runLabel} with ${randomMemoryActions.length} memory actions`;
+      randomState.textContent = aiMode ? 'AI Planning' : 'Live Run';
       try {
         const response = await fetch('/api/random/run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             dry_run: false,
+            ai_mode: aiMode,
             steps,
             delay_ms: delayMs,
             memory_actions: randomMemoryActions
@@ -3763,12 +4158,12 @@ HTML = r"""
         });
         const data = await response.json();
         if (!response.ok) {
-          statusLabel.textContent = data.error || 'Random explorer failed';
+          statusLabel.textContent = data.error || `${runLabel} failed`;
           randomState.textContent = 'Idle';
           setRandomRunning(false);
         }
       } catch (error) {
-        statusLabel.textContent = 'Random explorer failed';
+        statusLabel.textContent = `${runLabel} failed`;
         randomState.textContent = 'Idle';
         setRandomRunning(false);
       }
@@ -4015,6 +4410,7 @@ HTML = r"""
       if (tabName === 'random-test') {
         syncRandomControls();
         refreshOcrStatus();
+        refreshAiStatus();
         if (!isRandomRunning) {
           statusLabel.textContent = screen.naturalWidth && screen.naturalHeight
             ? 'Random Test ready'
@@ -4623,6 +5019,11 @@ def ocr_status():
     return jsonify(ocr_status_payload())
 
 
+@app.route("/api/ai/status")
+def ai_status():
+    return jsonify(ai_status_payload())
+
+
 @app.route("/api/results/screenshot/<path:filename>")
 def result_screenshot(filename):
     safe_name = Path(filename).name
@@ -4806,6 +5207,7 @@ def random_run():
     max_steps = int_value(payload.get("steps"), 20)
     delay_ms = int_value(payload.get("delay_ms"), 800)
     dry_run = bool(payload.get("dry_run", False))
+    ai_mode = bool(payload.get("ai_mode", False))
     try:
         memory_actions = normalize_random_memory_actions(payload.get("memory_actions") or [])
     except ValueError as exc:
@@ -4826,12 +5228,14 @@ def random_run():
             "delay_ms": delay_ms,
             "dry_run": dry_run,
             "memory_actions": memory_actions,
+            "ai_mode": ai_mode,
         },
         daemon=True,
     ).start()
     return jsonify({
         "status": "started",
         "dry_run": dry_run,
+        "ai_mode": ai_mode,
         "steps": max_steps,
         "memory_actions": len(memory_actions),
     })

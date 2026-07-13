@@ -37,6 +37,11 @@ if errorlevel 1 (
 echo        Done.
 echo.
 
+if not defined OPENAI_API_KEY (
+    echo [INFO] OPENAI_API_KEY is not set. AI Random Run will use Live Run fallback.
+    echo.
+)
+
 :: Show connected devices
 echo [2/3] Checking ADB devices...
 adb start-server > nul 2>&1

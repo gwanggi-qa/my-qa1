@@ -38,6 +38,22 @@ PC 브라우저에 실시간으로 표시합니다. Appium 자동화도 함께 �
 
 ## 설정 변경
 
+### AI Random Run
+
+`Random Test > AI Random Run`은 OpenAI API를 사용해 UIAutomator, OCR, Memory,
+업로드된 Test Case와 이전 AI 실행 결과를 바탕으로 실행 순서를 계획합니다.
+API 키는 소스 파일에 저장하지 않고 서버 프로세스의 환경변수로 설정합니다.
+
+```powershell
+$env:OPENAI_API_KEY="YOUR_API_KEY"
+$env:OPENAI_MODEL="gpt-5.6-luna"  # optional
+python mirror_server.py
+```
+
+키가 없거나 API 호출이 실패하면 동일한 후보를 사용하는 기존 Live Run 방식으로
+자동 전환되며, Random 패널과 상단 상태에 `AI: Fallback`이 표시됩니다.
+AI 실행 이력은 `qa_results/ai_random_history.jsonl`에 저장되어 다음 계획에 반영됩니다.
+
 ### 미러링 FPS / 화질 — `mirror_server.py` 상단
 
 ```python
