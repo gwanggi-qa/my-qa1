@@ -54,6 +54,20 @@ python mirror_server.py
 자동 전환되며, Random 패널과 상단 상태에 `AI: Fallback`이 표시됩니다.
 AI 실행 이력은 `qa_results/ai_random_history.jsonl`에 저장되어 다음 계획에 반영됩니다.
 
+### AI TC RUN
+
+`Test Case > AI TC RUN`은 업로드한 Excel 순서를 유지하면서 기존 UIAutomator/OCR
+실행을 우선합니다. 실행 대상이 모호하거나 실패한 항목만 현재 화면 스크린샷과
+UI 후보를 OpenAI API로 분석해 안전한 후보를 선택합니다.
+
+- 전체 Test Case 흐름 분석 후 25개 단위로 실행 힌트 생성
+- AI 복구 성공 결과는 Progress에 `ai-assisted`로 표시
+- 결제, 삭제, 탈퇴, 초기화, 앱 제거, 시스템 설정 변경은 `Block(N/A)` 처리
+- API 키가 없거나 호출이 실패하면 기존 Test Case 실행으로 자동 전환
+- 실행 이력은 `qa_results/ai_testcase_history.jsonl`에 저장
+
+AI TC RUN은 위의 `OPENAI_API_KEY`와 `OPENAI_MODEL` 설정을 AI Random Run과 공유합니다.
+
 ### 미러링 FPS / 화질 — `mirror_server.py` 상단
 
 ```python

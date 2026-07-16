@@ -35,12 +35,14 @@ BASE_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = BASE_DIR / "recordings"
 QA_RESULTS_DIR = BASE_DIR / "qa_results"
 AI_HISTORY_FILE = QA_RESULTS_DIR / "ai_random_history.jsonl"
+AI_TEST_HISTORY_FILE = QA_RESULTS_DIR / "ai_testcase_history.jsonl"
 OCR_LANGS = ["ko", "en"]
 OCR_MIN_CONFIDENCE = 0.35
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
 OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/responses").strip()
 AI_REQUEST_TIMEOUT_S = 45
 AI_HISTORY_LIMIT = 20
+AI_TEST_BATCH_SIZE = 25
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "tablet-mirror-secret"
@@ -51,6 +53,7 @@ _mirror_lock = threading.Lock()
 _adb_input_lock = threading.Lock()
 _test_lock = threading.Lock()
 _test_steps: list[dict[str, Any]] = []
+_test_metadata: dict[str, Any] = {}
 _test_running = False
 _test_stop_event = threading.Event()
 _random_lock = threading.Lock()
@@ -1173,9 +1176,10 @@ def parse_bounds(bounds):
 def text_candidates_from_step(step):
     candidates: list[str] = []
 
-    extra_candidates = step.get("assert_candidates") or []
-    if isinstance(extra_candidates, list):
-        candidates.extend(str(value).strip() for value in extra_candidates if str(value or "").strip())
+    for candidate_key in ("assert_candidates", "ai_target_candidates", "ai_expected_candidates"):
+        extra_candidates = step.get(candidate_key) or []
+        if isinstance(extra_candidates, list):
+            candidates.extend(str(value).strip() for value in extra_candidates if str(value or "").strip())
 
     for key in ("target", "value", "expected"):
         value = str(step.get(key) or "").strip()
@@ -1777,34 +1781,42 @@ def extract_openai_output_text(response_data):
     return "\n".join(parts).strip()
 
 
-def parse_ai_plan_json(text):
+def parse_openai_json(text):
     cleaned = str(text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
     data = json.loads(cleaned)
-    if not isinstance(data, dict) or not isinstance(data.get("steps"), list):
-        raise ValueError("AI planner response does not contain a steps list.")
+    if not isinstance(data, dict):
+        raise ValueError("AI response must be a JSON object.")
     return data
 
 
-def request_ai_random_plan(context):
+def request_openai_json(instructions, context, max_output_tokens=2400, image_png=None):
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
-    instructions = (
-        "You are a cautious Android QA planner. Select only candidate_id values provided by the user. "
-        "Plan the requested number of actions, favoring feature coverage, unseen paths, prior failures, "
-        "uploaded test-case intent, and memory actions. Never invent coordinates or actions. Avoid purchases, "
-        "account deletion, uninstall, factory reset, system settings, permissions, and other destructive flows. "
-        "Return only a JSON object with summary and steps. Each step must have candidate_id and a short reason."
-    )
+    content = [
+        {
+            "type": "input_text",
+            "text": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+        }
+    ]
+    if image_png:
+        encoded = base64.b64encode(image_png).decode("ascii")
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{encoded}",
+            }
+        )
+
     payload = {
         "model": OPENAI_MODEL,
         "instructions": instructions,
-        "input": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
-        "max_output_tokens": 2400,
+        "input": [{"role": "user", "content": content}],
+        "max_output_tokens": max_output_tokens,
     }
     http_request = urllib.request.Request(
         OPENAI_API_URL,
@@ -1833,8 +1845,29 @@ def request_ai_random_plan(context):
 
     output_text = extract_openai_output_text(response_data)
     if not output_text:
-        raise RuntimeError("OpenAI API returned no planner output")
-    return parse_ai_plan_json(output_text), response_data.get("usage") or {}
+        raise RuntimeError("OpenAI API returned no JSON output")
+    return parse_openai_json(output_text), response_data.get("usage") or {}
+
+
+def parse_ai_plan_json(text):
+    data = parse_openai_json(text)
+    if not isinstance(data.get("steps"), list):
+        raise ValueError("AI planner response does not contain a steps list.")
+    return data
+
+
+def request_ai_random_plan(context):
+    instructions = (
+        "You are a cautious Android QA planner. Select only candidate_id values provided by the user. "
+        "Plan the requested number of actions, favoring feature coverage, unseen paths, prior failures, "
+        "uploaded test-case intent, and memory actions. Never invent coordinates or actions. Avoid purchases, "
+        "account deletion, uninstall, factory reset, system settings, permissions, and other destructive flows. "
+        "Return only a JSON object with summary and steps. Each step must have candidate_id and a short reason."
+    )
+    data, usage = request_openai_json(instructions, context, max_output_tokens=2400)
+    if not isinstance(data.get("steps"), list):
+        raise ValueError("AI planner response does not contain a steps list.")
+    return data, usage
 
 
 def build_ai_random_plan(max_steps=10, memory_actions=None):
@@ -1907,6 +1940,366 @@ def build_ai_random_plan(max_steps=10, memory_actions=None):
         "usage": usage,
         "fallback": False,
     }
+
+
+AI_TEST_ALLOWED_ACTIONS = {"tap", "swipe", "assert_text", "wait", "input"}
+AI_TEST_RISKY_TEXT = (
+    *AI_RISKY_LABELS,
+    "delete",
+    "reset",
+    "system settings",
+    "permission",
+    "offline",
+    "wi-fi",
+    "wifi",
+    "force stop",
+    "power button",
+    "삭제",
+    "설정 변경",
+    "권한",
+    "오프라인",
+    "강제종료",
+    "전원 버튼",
+)
+
+
+def compact_test_step(index, step):
+    return {
+        "index": index,
+        "row": step.get("row", ""),
+        "case_no": str(step.get("case_no") or "")[:80],
+        "source": str(step.get("source") or "testcase"),
+        "action": str(step.get("action") or ""),
+        "target": str(step.get("target") or "")[:160],
+        "value": str(step.get("value") or "")[:120],
+        "expected": str(step.get("expected") or step.get("qa_expected") or "")[:220],
+        "description": str(step.get("description") or "")[:280],
+        "block_reason": str(step.get("block_reason") or "")[:180],
+    }
+
+
+def ai_test_step_is_risky(step):
+    text = " ".join(
+        str(step.get(key) or "")
+        for key in ("target", "value", "expected", "qa_expected", "description", "block_reason")
+    ).casefold()
+    return any(keyword.casefold() in text for keyword in AI_TEST_RISKY_TEXT)
+
+
+def load_ai_test_history(file_hash, limit=AI_HISTORY_LIMIT):
+    if not file_hash or not AI_TEST_HISTORY_FILE.exists():
+        return []
+    try:
+        lines = AI_TEST_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    history: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(item, dict) and item.get("file_hash") == file_hash:
+            history.append(item)
+            if len(history) >= max(1, limit):
+                break
+    history.reverse()
+    return history
+
+
+def append_ai_test_history(record):
+    QA_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with _ai_history_lock:
+        with AI_TEST_HISTORY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+
+def compact_ai_test_history(file_hash, limit=5):
+    compact: list[dict[str, Any]] = []
+    for run in load_ai_test_history(file_hash, limit=limit):
+        issues = []
+        for result in run.get("results") or []:
+            if result.get("status") in {"failed", "blocked"}:
+                issues.append(
+                    {
+                        "index": result.get("index"),
+                        "status": result.get("status"),
+                        "message": str(result.get("message") or "")[:240],
+                    }
+                )
+            if len(issues) >= 20:
+                break
+        compact.append(
+            {
+                "created_at": run.get("created_at"),
+                "summary": str(run.get("summary") or "")[:300],
+                "passed": run.get("passed", 0),
+                "failed": run.get("failed", 0),
+                "blocked": run.get("blocked", 0),
+                "ai_assisted": run.get("ai_assisted", 0),
+                "fallback": bool(run.get("fallback")),
+                "issues": issues,
+            }
+        )
+    return compact
+
+
+def emit_test_ai_status(state, message, **extra):
+    payload = {"state": state, "message": message, "model": OPENAI_MODEL, **extra}
+    socketio.emit("test_ai_status", payload, namespace="/mirror")
+
+
+def request_ai_test_overview(steps, metadata):
+    step_context = [compact_test_step(index, step) for index, step in enumerate(steps, start=1)]
+    context = {
+        "file": metadata,
+        "total_steps": len(steps),
+        "steps": step_context,
+        "recent_runs": compact_ai_test_history(str(metadata.get("file_hash") or ""), limit=5),
+        "response_schema": {
+            "summary": "short test-suite purpose and flow",
+            "risks": ["short risk"],
+            "execution_notes": ["short note"],
+        },
+    }
+    instructions = (
+        "You are an Android QA test-suite analyst. Analyze the uploaded cases without changing their order. "
+        "Identify the application flow, prerequisites, and unsafe cases. Do not propose purchases, deletion, "
+        "account changes, app removal, system settings, permissions, or device environment changes. "
+        "Return only JSON matching response_schema. Keep the summary and lists concise."
+    )
+    data, usage = request_openai_json(instructions, context, max_output_tokens=1800)
+    return {
+        "summary": str(data.get("summary") or "AI Test Case analysis ready")[:500],
+        "risks": [str(value)[:200] for value in (data.get("risks") or [])[:20]],
+        "execution_notes": [str(value)[:200] for value in (data.get("execution_notes") or [])[:20]],
+        "usage": usage,
+    }
+
+
+def request_ai_test_batch_hints(steps, start_index, overview, metadata):
+    batch_context = [
+        compact_test_step(start_index + offset, step)
+        for offset, step in enumerate(steps)
+    ]
+    context = {
+        "file": metadata,
+        "suite_summary": overview.get("summary", ""),
+        "steps": batch_context,
+        "response_schema": {
+            "hints": [
+                {
+                    "index": start_index,
+                    "intent": "short intent",
+                    "target_candidates": ["visible label"],
+                    "expected_candidates": ["expected visible text"],
+                    "risk": "safe or blocked",
+                    "reason": "short reason",
+                }
+            ]
+        },
+    }
+    instructions = (
+        "You are preparing execution hints for Android QA cases. Preserve every Excel index and action. "
+        "Extract concise visible labels that UIAutomator or OCR can match. Do not invent coordinates, input values, "
+        "or additional actions. Mark destructive, account, payment, deletion, app removal, permission, system-setting, "
+        "offline, or device-control cases as blocked. Return only JSON matching response_schema."
+    )
+    data, usage = request_openai_json(instructions, context, max_output_tokens=4200)
+    hints: dict[int, dict[str, Any]] = {}
+    valid_indexes = set(range(start_index, start_index + len(steps)))
+    for item in data.get("hints") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index not in valid_indexes:
+            continue
+        hints[index] = {
+            "intent": str(item.get("intent") or "")[:200],
+            "target_candidates": [str(value).strip()[:100] for value in (item.get("target_candidates") or [])[:8] if str(value or "").strip()],
+            "expected_candidates": [str(value).strip()[:100] for value in (item.get("expected_candidates") or [])[:8] if str(value or "").strip()],
+            "risk": str(item.get("risk") or "safe").strip().lower(),
+            "reason": str(item.get("reason") or "")[:240],
+        }
+    return hints, usage
+
+
+def apply_ai_test_hint(step, hint):
+    enriched = dict(step)
+    if not hint:
+        return enriched
+    enriched["ai_hint"] = hint
+    enriched["ai_target_candidates"] = list(hint.get("target_candidates") or [])
+    enriched["ai_expected_candidates"] = list(hint.get("expected_candidates") or [])
+    return enriched
+
+
+def ai_test_screen_candidates():
+    candidates = [candidate for candidate in collect_random_candidates([]) if ai_candidate_is_safe(candidate)]
+    candidate_context = []
+    for candidate in candidates[:100]:
+        candidate_context.append(
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "label": str(candidate.get("label") or "")[:160],
+                "action": candidate.get("action"),
+                "source": candidate.get("source"),
+                "bounds": candidate.get("bounds"),
+                "score": candidate.get("score"),
+            }
+        )
+    return candidates[:100], candidate_context
+
+
+def request_ai_test_recovery(index, step, original_error, overview, metadata):
+    candidates, candidate_context = ai_test_screen_candidates()
+    if not candidates:
+        raise RuntimeError("No safe current-screen candidates found for AI recovery")
+    screenshot = capture_screen_png()
+    context = {
+        "file": metadata,
+        "suite_summary": overview.get("summary", ""),
+        "failed_step": compact_test_step(index, step),
+        "original_error": str(original_error)[:500],
+        "screen_candidates": candidate_context,
+        "recent_runs": compact_ai_test_history(str(metadata.get("file_hash") or ""), limit=3),
+        "response_schema": {
+            "decision": "execute, blocked, or fail",
+            "action": "tap, swipe, assert_text, wait, or input",
+            "candidate_id": "c001 or blank",
+            "wait_ms": 1000,
+            "reason": "short reason",
+        },
+    }
+    instructions = (
+        "You are recovering one failed Android QA step using the attached current screenshot and the supplied "
+        "UIAutomator/OCR candidates. Select only an existing candidate_id; never invent coordinates. Input is allowed "
+        "only when failed_step.value is non-empty. Return blocked for destructive, payment, deletion, account, app "
+        "removal, permission, system-setting, offline, or device-control operations. Otherwise return execute or fail. "
+        "Return only JSON matching response_schema."
+    )
+    data, usage = request_openai_json(
+        instructions,
+        context,
+        max_output_tokens=1400,
+        image_png=screenshot,
+    )
+    decision = str(data.get("decision") or "fail").strip().lower()
+    action = str(data.get("action") or "").strip().lower()
+    candidate_id = str(data.get("candidate_id") or "").strip()
+    candidate_map = {str(candidate.get("candidate_id")): candidate for candidate in candidates}
+    candidate = candidate_map.get(candidate_id)
+    try:
+        wait_ms = max(100, min(int_value(data.get("wait_ms"), 1000), 5000))
+    except (TypeError, ValueError):
+        wait_ms = 1000
+    return {
+        "decision": decision,
+        "action": action,
+        "candidate": candidate,
+        "candidate_id": candidate_id,
+        "wait_ms": wait_ms,
+        "reason": str(data.get("reason") or "AI recovery")[:300],
+        "usage": usage,
+    }
+
+
+def ai_test_expected_candidates(step):
+    values: list[str] = []
+    for key in ("ai_expected_candidates", "assert_candidates"):
+        source_values = step.get(key) or []
+        if isinstance(source_values, list):
+            values.extend(str(value).strip() for value in source_values if str(value or "").strip())
+    expected = str(step.get("expected") or step.get("qa_expected") or "").strip()
+    if expected and len(expected) <= 120:
+        values.append(expected)
+    return list(dict.fromkeys(values))[:12]
+
+
+def execute_ai_test_candidate(candidate):
+    action = candidate.get("action")
+    before_hash = capture_screen_hash()
+    if action == "tap":
+        args = ("shell", "input", "tap", str(candidate["x"]), str(candidate["y"]))
+        message = f"Tapped '{candidate.get('label', '')}' at ({candidate['x']}, {candidate['y']})"
+    elif action == "swipe":
+        step = candidate.get("step") or {}
+        args = (
+            "shell",
+            "input",
+            "swipe",
+            str(step["x1"]),
+            str(step["y1"]),
+            str(step["x2"]),
+            str(step["y2"]),
+            str(step.get("duration_ms", 450)),
+        )
+        message = f"Swiped '{candidate.get('label', '')}'"
+    else:
+        raise ValueError("AI candidate action is not executable")
+    with _adb_input_lock:
+        _, err, rc = adb(*args)
+    if rc:
+        raise RuntimeError(err.decode(errors="ignore") or "AI-assisted ADB input failed")
+    changed = wait_for_screen_change(before_hash, timeout_s=4.0, stop_event=_test_stop_event)
+    return f"{message}; {'screen changed' if changed else 'input sent'}"
+
+
+def execute_ai_test_recovery(step, recovery):
+    decision = recovery.get("decision")
+    reason = recovery.get("reason") or "AI recovery"
+    if decision == "blocked":
+        raise BlockedStep(f"AI blocked: {reason}")
+    if decision != "execute":
+        raise RuntimeError(f"AI could not recover this step: {reason}")
+
+    action = recovery.get("action")
+    if action not in AI_TEST_ALLOWED_ACTIONS:
+        raise RuntimeError(f"AI returned unsupported action: {action or 'blank'}")
+    candidate = recovery.get("candidate")
+
+    if action == "assert_text":
+        if not candidate:
+            raise RuntimeError("AI assert_text did not select a current-screen candidate")
+        result = f"AI verified visible text '{candidate.get('label', '')}'"
+    elif action in {"tap", "swipe"}:
+        if not candidate or candidate.get("action") != action:
+            raise RuntimeError("AI selected candidate does not match the requested action")
+        result = execute_ai_test_candidate(candidate)
+    elif action == "input":
+        value = str(step.get("value") or "").strip()
+        if not value:
+            raise RuntimeError("AI input recovery requires an Excel input value")
+        if not candidate or candidate.get("action") != "tap":
+            raise RuntimeError("AI input recovery requires a tappable field candidate")
+        with _adb_input_lock:
+            _, tap_err, tap_rc = adb("shell", "input", "tap", str(candidate["x"]), str(candidate["y"]))
+            if tap_rc:
+                raise RuntimeError(tap_err.decode(errors="ignore") or "AI input focus tap failed")
+            _, input_err, input_rc = adb("shell", "input", "text", adb_text_arg(value))
+        if input_rc:
+            raise RuntimeError(input_err.decode(errors="ignore") or "AI input failed")
+        result = f"AI entered Excel value into '{candidate.get('label', '')}'"
+    else:
+        deadline = time.time() + (recovery.get("wait_ms", 1000) / 1000)
+        while time.time() < deadline:
+            if _test_stop_event.is_set():
+                raise RuntimeError("Test Case stopped")
+            time.sleep(min(0.1, max(0, deadline - time.time())))
+        result = execute_step(step)
+
+    expected_candidates = ai_test_expected_candidates(step)
+    if action in {"tap", "swipe", "input"} and expected_candidates:
+        matched = wait_until_any_ui_contains(expected_candidates, timeout_s=3.0)
+        if not matched:
+            raise AssertionError("AI action completed but expected text was not found")
+        result = f"{result}; found '{matched}'"
+    return f"ai-assisted: {reason}; {result}"
 
 
 def detect_runtime_errors():
@@ -2687,20 +3080,29 @@ def execute_step(step):
     raise ValueError(f"Unsupported action: {action}")
 
 
-def run_test_steps():
+def run_test_steps(ai_mode=False):
     global _test_running
 
     with _test_lock:
         steps = list(_test_steps)
+        metadata = dict(_test_metadata)
 
     total = len(steps)
     passed = 0
     failed = 0
     blocked = 0
+    ai_assisted = 0
+    ai_fallback = False
+    ai_active = ai_mode
+    ai_overview: dict[str, Any] = {}
+    ai_hints: dict[int, dict[str, Any]] = {}
+    run_results: list[dict[str, Any]] = []
+    run_id = uuid.uuid4().hex
+    mode = "ai" if ai_mode else "standard"
 
     socketio.emit(
         "test_run_started",
-        {"total": total, "started_at": time.strftime("%H:%M:%S")},
+        {"total": total, "mode": mode, "started_at": time.strftime("%H:%M:%S")},
         namespace="/mirror",
     )
 
@@ -2709,61 +3111,244 @@ def run_test_steps():
             raise RuntimeError("No adb device. Check USB connection and USB debugging.")
         validate_recorder_resolution(steps)
 
+        if ai_mode:
+            emit_test_ai_status("analyzing", f"Analyzing {total} Test Case steps")
+            try:
+                ai_overview = request_ai_test_overview(steps, metadata)
+                emit_test_ai_status("executing", ai_overview.get("summary") or "AI Test Case analysis ready")
+            except Exception as exc:
+                ai_active = False
+                ai_fallback = True
+                emit_test_ai_status("fallback", f"AI TC fallback to standard execution: {exc}")
+
         for index, step in enumerate(steps, start=1):
             if _test_stop_event.is_set():
                 break
-            started = time.time()
-            emit_progress(StepResult(index=index, total=total, status="running", step=step))
-            try:
-                delay_ms = apply_recorder_delay(step)
-                message = execute_step(step)
-                if delay_ms:
-                    message = f"Waited {delay_ms}ms; {message}"
-                elapsed_ms = int((time.time() - started) * 1000)
-                passed += 1
-                emit_progress(
-                    StepResult(
-                        index=index,
-                        total=total,
-                        status="passed",
-                        step=step,
-                        message=message,
-                        elapsed_ms=elapsed_ms,
+
+            if ai_active and (index - 1) % AI_TEST_BATCH_SIZE == 0:
+                batch = steps[index - 1:index - 1 + AI_TEST_BATCH_SIZE]
+                try:
+                    batch_hints, _ = request_ai_test_batch_hints(
+                        batch,
+                        index,
+                        ai_overview,
+                        metadata,
                     )
-                )
-            except BlockedStep as exc:
+                    ai_hints.update(batch_hints)
+                    emit_test_ai_status(
+                        "executing",
+                        f"AI hints ready for steps {index}-{index + len(batch) - 1}",
+                        batch_start=index,
+                        batch_end=index + len(batch) - 1,
+                    )
+                except Exception as exc:
+                    ai_active = False
+                    ai_fallback = True
+                    emit_test_ai_status("fallback", f"AI hint generation failed; continuing standard execution: {exc}")
+                if _test_stop_event.is_set():
+                    break
+
+            active_step = apply_ai_test_hint(step, ai_hints.get(index)) if ai_active else dict(step)
+            started = time.time()
+            emit_progress(StepResult(index=index, total=total, status="running", step=active_step))
+
+            ai_hint_blocked = str((active_step.get("ai_hint") or {}).get("risk") or "").lower() == "blocked"
+            if ai_mode and (ai_test_step_is_risky(active_step) or ai_hint_blocked):
                 elapsed_ms = int((time.time() - started) * 1000)
+                hint_reason = str((active_step.get("ai_hint") or {}).get("reason") or "").strip()
+                reason = f"Blocked by AI TC safety policy{f': {hint_reason}' if hint_reason else '.'}"
                 blocked += 1
+                run_results.append({"index": index, "status": "blocked", "message": reason, "ai_assisted": False})
                 emit_progress(
                     StepResult(
                         index=index,
                         total=total,
                         status="blocked",
-                        step=step,
-                        message=str(exc),
+                        step=active_step,
+                        message=reason,
                         elapsed_ms=elapsed_ms,
                     )
                 )
-            except Exception as exc:
+                continue
+
+            try:
+                delay_ms = apply_recorder_delay(active_step)
+                message = execute_step(active_step)
+                if delay_ms:
+                    message = f"Waited {delay_ms}ms; {message}"
                 elapsed_ms = int((time.time() - started) * 1000)
-                failed += 1
-                extra = failure_extra("testcase", index)
+                passed += 1
+                run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": False})
                 emit_progress(
                     StepResult(
                         index=index,
                         total=total,
-                        status="failed",
-                        step=step,
-                        message=str(exc),
+                        status="passed",
+                        step=active_step,
+                        message=message,
                         elapsed_ms=elapsed_ms,
-                        extra=extra,
                     )
                 )
+            except BlockedStep as exc:
+                original_error = str(exc)
+                recovered = False
+                recovery_error = ""
+                if ai_active:
+                    emit_test_ai_status("assisting", f"AI assisting Test Case step {index}", step=index)
+                    try:
+                        recovery = request_ai_test_recovery(index, active_step, original_error, ai_overview, metadata)
+                    except Exception as ai_exc:
+                        ai_active = False
+                        ai_fallback = True
+                        recovery_error = str(ai_exc)
+                        emit_test_ai_status("fallback", f"AI recovery unavailable; continuing standard execution: {ai_exc}")
+                    else:
+                        if _test_stop_event.is_set():
+                            break
+                        try:
+                            message = execute_ai_test_recovery(active_step, recovery)
+                            recovered = True
+                        except Exception as recovery_exc:
+                            recovery_error = str(recovery_exc)
+
+                elapsed_ms = int((time.time() - started) * 1000)
+                if recovered:
+                    passed += 1
+                    ai_assisted += 1
+                    run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": True})
+                    emit_progress(
+                        StepResult(
+                            index=index,
+                            total=total,
+                            status="passed",
+                            step=active_step,
+                            message=message,
+                            elapsed_ms=elapsed_ms,
+                            extra={"ai_assisted": True, "ai_hint": active_step.get("ai_hint", {})},
+                        )
+                    )
+                else:
+                    blocked += 1
+                    message = original_error if not recovery_error else f"{original_error}; AI: {recovery_error}"
+                    run_results.append({"index": index, "status": "blocked", "message": message, "ai_assisted": False})
+                    emit_progress(
+                        StepResult(
+                            index=index,
+                            total=total,
+                            status="blocked",
+                            step=active_step,
+                            message=message,
+                            elapsed_ms=elapsed_ms,
+                        )
+                    )
+            except Exception as exc:
+                original_error = str(exc)
+                recovered = False
+                recovery_blocked = False
+                recovery_error = ""
+                if ai_active:
+                    emit_test_ai_status("assisting", f"AI assisting Test Case step {index}", step=index)
+                    try:
+                        recovery = request_ai_test_recovery(index, active_step, original_error, ai_overview, metadata)
+                    except Exception as ai_exc:
+                        ai_active = False
+                        ai_fallback = True
+                        recovery_error = str(ai_exc)
+                        emit_test_ai_status("fallback", f"AI recovery unavailable; continuing standard execution: {ai_exc}")
+                    else:
+                        if _test_stop_event.is_set():
+                            break
+                        try:
+                            message = execute_ai_test_recovery(active_step, recovery)
+                            recovered = True
+                        except BlockedStep as recovery_exc:
+                            recovery_blocked = True
+                            recovery_error = str(recovery_exc)
+                        except Exception as recovery_exc:
+                            recovery_error = str(recovery_exc)
+
+                elapsed_ms = int((time.time() - started) * 1000)
+                if recovered:
+                    passed += 1
+                    ai_assisted += 1
+                    run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": True})
+                    emit_progress(
+                        StepResult(
+                            index=index,
+                            total=total,
+                            status="passed",
+                            step=active_step,
+                            message=message,
+                            elapsed_ms=elapsed_ms,
+                            extra={"ai_assisted": True, "ai_hint": active_step.get("ai_hint", {})},
+                        )
+                    )
+                elif recovery_blocked:
+                    blocked += 1
+                    message = f"{original_error}; {recovery_error}"
+                    run_results.append({"index": index, "status": "blocked", "message": message, "ai_assisted": False})
+                    emit_progress(
+                        StepResult(
+                            index=index,
+                            total=total,
+                            status="blocked",
+                            step=active_step,
+                            message=message,
+                            elapsed_ms=elapsed_ms,
+                        )
+                    )
+                else:
+                    failed += 1
+                    message = original_error if not recovery_error else f"{original_error}; AI: {recovery_error}"
+                    run_results.append({"index": index, "status": "failed", "message": message, "ai_assisted": False})
+                    extra = failure_extra("testcase-ai" if ai_mode else "testcase", index)
+                    if ai_mode:
+                        extra.update({"ai_assisted": False, "ai_hint": active_step.get("ai_hint", {})})
+                    emit_progress(
+                        StepResult(
+                            index=index,
+                            total=total,
+                            status="failed",
+                            step=active_step,
+                            message=message,
+                            elapsed_ms=elapsed_ms,
+                            extra=extra,
+                        )
+                    )
     except Exception as exc:
         socketio.emit("test_error", {"msg": str(exc)}, namespace="/mirror")
     finally:
+        if ai_mode:
+            try:
+                append_ai_test_history(
+                    {
+                        "run_id": run_id,
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "file_hash": metadata.get("file_hash", ""),
+                        "filename": metadata.get("filename", ""),
+                        "source": metadata.get("source", ""),
+                        "model": OPENAI_MODEL,
+                        "summary": ai_overview.get("summary", ""),
+                        "fallback": ai_fallback,
+                        "total": total,
+                        "passed": passed,
+                        "failed": failed,
+                        "blocked": blocked,
+                        "ai_assisted": ai_assisted,
+                        "results": run_results,
+                    }
+                )
+            except OSError:
+                pass
         _test_running = False
         _test_stop_event.clear()
+        if ai_mode:
+            emit_test_ai_status(
+                "done",
+                f"AI TC done: {passed} passed, {failed} failed, {blocked} blocked, {ai_assisted} AI-assisted",
+                ai_fallback=ai_fallback,
+                ai_assisted=ai_assisted,
+            )
         socketio.emit(
             "test_run_finished",
             {
@@ -2771,6 +3356,9 @@ def run_test_steps():
                 "passed": passed,
                 "failed": failed,
                 "blocked": blocked,
+                "mode": mode,
+                "ai_fallback": ai_fallback,
+                "ai_assisted": ai_assisted,
                 "finished_at": time.strftime("%H:%M:%S"),
             },
             namespace="/mirror",
@@ -2957,6 +3545,7 @@ HTML = r"""
     .btn-load,
     .btn-upload { background: var(--blue); }
     .btn-run { background: #5b63c7; }
+    .btn-ai-test { background: #355bc1; }
     .btn-random-dry { background: #6b7280; }
     .btn-random-dry.active { background: var(--accent); }
     .btn-random-live { background: #ad6b2d; }
@@ -2990,6 +3579,7 @@ HTML = r"""
     .icon-upload::before { content: "^"; }
     .icon-run::before,
     .icon-play::before { content: ">"; }
+    .icon-ai-test::before { content: "AI"; font-size: 10px; }
     .icon-dry::before { content: "M"; }
     .icon-live::before { content: ">"; }
     .icon-ai::before { content: "AI"; font-size: 10px; }
@@ -3014,8 +3604,25 @@ HTML = r"""
 
     .test-actions {
       display: grid;
-      grid-template-columns: 1fr 110px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 90px;
       gap: 8px;
+    }
+
+    .test-ai-state {
+      min-height: 28px;
+      padding: 7px 9px;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .test-ai-state.active {
+      color: #fff;
+      border-color: rgba(53, 91, 193, .7);
+      background: rgba(53, 91, 193, .22);
     }
 
     .tab-bar {
@@ -3549,8 +4156,10 @@ HTML = r"""
           </div>
           <div class="test-actions">
             <button class="btn-run" id="btn-run" type="button" onclick="runTestCase()" disabled><span class="ui-icon icon-run" aria-hidden="true"></span>Run Test Case</button>
+            <button class="btn-ai-test" id="btn-ai-test" type="button" onclick="runTestCase(true)" disabled><span class="ui-icon icon-ai-test" aria-hidden="true"></span>AI TC RUN</button>
             <button class="btn-secondary" id="btn-test-stop" type="button" onclick="stopTestCase()" disabled><span class="ui-icon icon-stop" aria-hidden="true"></span>Stop</button>
           </div>
+          <div class="test-ai-state" id="test-ai-state">AI TC: Checking</div>
           <section class="case-panel" aria-label="Uploaded test cases">
             <div class="panel-head">
               <span>Uploaded Test Case</span>
@@ -3689,7 +4298,9 @@ HTML = r"""
     const mouseInfo = document.getElementById('mouse-info');
     const fileInput = document.getElementById('excel-file');
     const runButton = document.getElementById('btn-run');
+    const aiRunButton = document.getElementById('btn-ai-test');
     const testStopButton = document.getElementById('btn-test-stop');
+    const testAiState = document.getElementById('test-ai-state');
     const caseList = document.getElementById('case-list');
     const caseCount = document.getElementById('case-count');
     const progressList = document.getElementById('progress-list');
@@ -3823,7 +4434,12 @@ HTML = r"""
     updateRecorderControls();
 
     socket.on('test_run_started', (data) => {
-      statusLabel.textContent = 'Running test case';
+      const label = data.mode === 'ai' ? 'AI TC RUN' : 'Running test case';
+      statusLabel.textContent = label;
+      if (data.mode === 'ai') {
+        testAiState.textContent = 'AI TC: Analyzing';
+        testAiState.classList.add('active');
+      }
       runSummary.textContent = `0 / ${data.total}`;
       setTestRunning(true);
       resetProgressState();
@@ -3838,13 +4454,35 @@ HTML = r"""
       statusLabel.textContent = data.msg || 'Test error';
     });
 
+    socket.on('test_ai_status', (data) => {
+      const state = data.state || 'unknown';
+      const labels = {
+        analyzing: 'AI TC: Analyzing',
+        executing: 'AI TC: Executing',
+        assisting: `AI TC: Assisting${data.step ? ` step ${data.step}` : ''}`,
+        fallback: 'AI TC: Fallback',
+        done: 'AI TC: Done'
+      };
+      testAiState.textContent = labels[state] || 'AI TC: Unknown';
+      testAiState.title = data.message || '';
+      testAiState.classList.toggle('active', ['analyzing', 'executing', 'assisting'].includes(state));
+      statusLabel.textContent = data.message || testAiState.textContent;
+    });
+
     socket.on('test_run_finished', (data) => {
       const blocked = data.blocked || 0;
-      statusLabel.textContent = `Done: ${data.passed} passed, ${data.failed} failed, ${blocked} blocked`;
-      runSummary.textContent = `${data.passed} passed / ${data.failed} failed / ${blocked} blocked`;
+      const assisted = data.ai_assisted || 0;
+      const isAi = data.mode === 'ai';
+      statusLabel.textContent = isAi
+        ? `AI TC Done: ${data.passed} passed, ${data.failed} failed, ${blocked} blocked, ${assisted} AI-assisted`
+        : `Done: ${data.passed} passed, ${data.failed} failed, ${blocked} blocked`;
+      runSummary.textContent = isAi
+        ? `${data.passed} passed / ${data.failed} failed / ${blocked} blocked / ${assisted} AI-assisted`
+        : `${data.passed} passed / ${data.failed} failed / ${blocked} blocked`;
       setTestRunning(false);
       isPlayingRecording = false;
       updateRecorderControls();
+      refreshAiStatus();
     });
 
     function randomModeLabel(mode) {
@@ -3963,9 +4601,16 @@ HTML = r"""
           : 'AI: API key required';
         aiState.title = data.message || '';
         aiState.classList.toggle('active', Boolean(data.configured));
+        testAiState.textContent = data.configured
+          ? `AI TC: Ready (${data.model})`
+          : 'AI TC: API key required';
+        testAiState.title = data.message || '';
+        testAiState.classList.toggle('active', Boolean(data.configured));
       } catch (error) {
         aiState.textContent = 'AI: Unknown';
         aiState.classList.remove('active');
+        testAiState.textContent = 'AI TC: Unknown';
+        testAiState.classList.remove('active');
       }
     }
 
@@ -4044,14 +4689,19 @@ HTML = r"""
       }
     }
 
-    async function runTestCase() {
+    async function runTestCase(aiMode = false) {
       if (!loadedSteps.length) {
         statusLabel.textContent = 'Upload a test case first.';
         return;
       }
 
       setTestRunning(true);
-      const response = await fetch('/api/run', { method: 'POST' });
+      statusLabel.textContent = aiMode ? 'Preparing AI TC RUN' : 'Preparing Test Case run';
+      const response = await fetch('/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ai_mode: aiMode })
+      });
       const data = await response.json();
       if (!response.ok) {
         statusLabel.textContent = data.error || 'Run failed';
@@ -4071,6 +4721,7 @@ HTML = r"""
     function setTestRunning(running) {
       isTestRunning = running;
       runButton.disabled = running || loadedSteps.length === 0;
+      aiRunButton.disabled = running || loadedSteps.length === 0;
       testStopButton.disabled = !running;
     }
 
@@ -5039,12 +5690,13 @@ def result_screenshot(filename):
 
 @app.route("/api/testcase", methods=["GET", "POST"])
 def upload_testcase():
-    global _test_steps
+    global _test_steps, _test_metadata
 
     if request.method == "GET":
         with _test_lock:
             steps = list(_test_steps)
-        return jsonify({"steps": steps, "count": len(steps), "source": testcase_source(steps)})
+            metadata = dict(_test_metadata)
+        return jsonify({"steps": steps, "count": len(steps), "source": testcase_source(steps), "metadata": metadata})
 
     file_storage = request.files.get("file")
     if not file_storage:
@@ -5055,22 +5707,37 @@ def upload_testcase():
         return jsonify({"error": "Upload an .xlsx or .xlsm file."}), 400
 
     try:
+        file_storage.stream.seek(0)
+        file_payload = file_storage.stream.read()
+        file_storage.stream.seek(0)
         steps = parse_excel(file_storage)
     except Exception as exc:
         with _test_lock:
             _test_steps = []
+            _test_metadata = {}
         return jsonify({"error": str(exc)}), 400
 
+    source = testcase_source(steps)
+    metadata = {
+        "filename": filename,
+        "file_hash": hashlib.sha256(file_payload).hexdigest(),
+        "source": source,
+        "count": len(steps),
+        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+    }
     with _test_lock:
         _test_steps = steps
+        _test_metadata = metadata
 
-    return jsonify({"steps": steps, "count": len(steps), "source": testcase_source(steps)})
+    return jsonify({"steps": steps, "count": len(steps), "source": source, "metadata": metadata})
 
 
 @app.route("/api/run", methods=["POST"])
 def run_testcase():
     global _test_running
 
+    payload = request.get_json(silent=True) or {}
+    ai_mode = bool(payload.get("ai_mode", False))
     with _test_lock:
         if not _test_steps:
             return jsonify({"error": "Upload a test case first."}), 400
@@ -5079,8 +5746,8 @@ def run_testcase():
         _test_running = True
         _test_stop_event.clear()
 
-    threading.Thread(target=run_test_steps, daemon=True).start()
-    return jsonify({"status": "started"})
+    threading.Thread(target=run_test_steps, kwargs={"ai_mode": ai_mode}, daemon=True).start()
+    return jsonify({"status": "started", "mode": "ai" if ai_mode else "standard"})
 
 
 @app.route("/api/run/stop", methods=["POST"])
