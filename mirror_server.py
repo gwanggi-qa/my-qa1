@@ -977,18 +977,68 @@ def current_device_resolution():
     return parse_resolution_text(resolution_text)
 
 
-def validate_recorder_resolution(steps):
+def current_screen_resolution():
+    """Return the actual screencap size so display rotation is reflected."""
+    try:
+        from PIL import Image
+
+        raw = capture_screen_png()
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+        if width > 0 and height > 0:
+            return width, height, "screencap"
+    except Exception:
+        pass
+
+    fallback = current_device_resolution()
+    if fallback:
+        return fallback[0], fallback[1], "wm_size"
+    return None
+
+
+def resolution_payload(resolution):
+    if not resolution:
+        return None
+    width, height, source = resolution
+    orientation = "landscape" if width > height else "portrait" if height > width else "square"
+    return {"width": width, "height": height, "source": source, "orientation": orientation}
+
+
+def recorder_resolution_status(steps):
     expected = recorder_resolution_from_steps(steps)
     if not expected:
-        return
-    current = current_device_resolution()
-    if not current:
-        raise RuntimeError("Could not read current device resolution for Recorder Excel.")
-    if current != expected:
-        raise RuntimeError(
-            f"Recorder Excel resolution {expected[0]}x{expected[1]} "
-            f"does not match current device {current[0]}x{current[1]}."
+        return None
+
+    current = current_screen_resolution()
+    expected_payload = resolution_payload((expected[0], expected[1], "recording"))
+    current_payload = resolution_payload(current)
+    return {
+        "expected": expected_payload,
+        "current": current_payload,
+        "matches": bool(current and (current[0], current[1]) == expected),
+    }
+
+
+class RecorderResolutionMismatch(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        expected = status["expected"]
+        current = status["current"]
+        super().__init__(
+            f"Recorder Excel resolution {expected['width']}x{expected['height']} "
+            f"does not match current screen {current['width']}x{current['height']}. "
+            "Rotate the device to the recorded orientation before running."
         )
+
+
+def validate_recorder_resolution(steps):
+    status = recorder_resolution_status(steps)
+    if not status:
+        return
+    if not status["current"]:
+        raise RuntimeError("Could not read current screen resolution for Recorder Excel.")
+    if not status["matches"]:
+        raise RecorderResolutionMismatch(status)
 
 
 def apply_recorder_delay(step):
@@ -3625,6 +3675,30 @@ HTML = r"""
       background: rgba(53, 91, 193, .22);
     }
 
+    .test-resolution-state {
+      min-height: 28px;
+      padding: 7px 9px;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.4;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .test-resolution-state.match {
+      color: #a8f2c8;
+      border-color: rgba(62, 173, 111, .62);
+      background: rgba(62, 173, 111, .16);
+    }
+
+    .test-resolution-state.mismatch {
+      color: #ffd39a;
+      border-color: rgba(217, 164, 65, .72);
+      background: rgba(217, 164, 65, .16);
+    }
+
     .tab-bar {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
@@ -4160,6 +4234,7 @@ HTML = r"""
             <button class="btn-secondary" id="btn-test-stop" type="button" onclick="stopTestCase()" disabled><span class="ui-icon icon-stop" aria-hidden="true"></span>Stop</button>
           </div>
           <div class="test-ai-state" id="test-ai-state">AI TC: Checking</div>
+          <div class="test-resolution-state" id="test-resolution-state" hidden></div>
           <section class="case-panel" aria-label="Uploaded test cases">
             <div class="panel-head">
               <span>Uploaded Test Case</span>
@@ -4301,6 +4376,7 @@ HTML = r"""
     const aiRunButton = document.getElementById('btn-ai-test');
     const testStopButton = document.getElementById('btn-test-stop');
     const testAiState = document.getElementById('test-ai-state');
+    const testResolutionState = document.getElementById('test-resolution-state');
     const caseList = document.getElementById('case-list');
     const caseCount = document.getElementById('case-count');
     const progressList = document.getElementById('progress-list');
@@ -4654,6 +4730,7 @@ HTML = r"""
         loadedSteps = [];
         renderCases(loadedSteps);
         renderProgress(loadedSteps, 'waiting');
+        updateRecorderResolutionState(null);
         setTestRunning(false);
         runSummary.textContent = 'Upload failed';
         statusLabel.textContent = data.error || 'Upload failed';
@@ -4663,6 +4740,7 @@ HTML = r"""
       loadedSteps = data.steps || [];
       renderCases(loadedSteps);
       renderProgress(loadedSteps, 'waiting');
+      updateRecorderResolutionState(data.recorder_resolution);
       setTestRunning(false);
       statusLabel.textContent = data.source === 'recorder'
         ? `Loaded Recorder Excel: ${loadedSteps.length} steps`
@@ -4681,12 +4759,37 @@ HTML = r"""
       }
       const data = await response.json();
       loadedSteps = data.steps || [];
+      updateRecorderResolutionState(data.recorder_resolution);
       if (loadedSteps.length) {
         renderCases(loadedSteps);
         renderProgress(loadedSteps, 'waiting');
         setTestRunning(false);
         runSummary.textContent = 'Ready';
       }
+    }
+
+    function updateRecorderResolutionState(resolution) {
+      if (!resolution || !resolution.expected) {
+        testResolutionState.hidden = true;
+        testResolutionState.textContent = '';
+        testResolutionState.classList.remove('match', 'mismatch');
+        return;
+      }
+
+      const label = (item) => {
+        if (!item) return '-';
+        const orientation = item.orientation === 'landscape' ? '가로' : item.orientation === 'portrait' ? '세로' : '정사각';
+        return `${item.width}×${item.height} (${orientation})`;
+      };
+      const expected = label(resolution.expected);
+      const current = label(resolution.current);
+      const matches = Boolean(resolution.matches);
+      testResolutionState.hidden = false;
+      testResolutionState.classList.toggle('match', matches);
+      testResolutionState.classList.toggle('mismatch', !matches);
+      testResolutionState.textContent = matches
+        ? `Recorder: ${expected} / Current: ${current} — 실행 가능`
+        : `Recorder: ${expected} / Current: ${current} — 기기를 ${resolution.expected.orientation === 'landscape' ? '가로' : '세로'}로 전환한 뒤 실행하세요.`;
     }
 
     async function runTestCase(aiMode = false) {
@@ -4704,6 +4807,9 @@ HTML = r"""
       });
       const data = await response.json();
       if (!response.ok) {
+        if (Object.prototype.hasOwnProperty.call(data, 'recorder_resolution')) {
+          updateRecorderResolutionState(data.recorder_resolution);
+        }
         statusLabel.textContent = data.error || 'Run failed';
         setTestRunning(false);
       }
@@ -5696,7 +5802,15 @@ def upload_testcase():
         with _test_lock:
             steps = list(_test_steps)
             metadata = dict(_test_metadata)
-        return jsonify({"steps": steps, "count": len(steps), "source": testcase_source(steps), "metadata": metadata})
+        return jsonify(
+            {
+                "steps": steps,
+                "count": len(steps),
+                "source": testcase_source(steps),
+                "metadata": metadata,
+                "recorder_resolution": recorder_resolution_status(steps),
+            }
+        )
 
     file_storage = request.files.get("file")
     if not file_storage:
@@ -5729,7 +5843,15 @@ def upload_testcase():
         _test_steps = steps
         _test_metadata = metadata
 
-    return jsonify({"steps": steps, "count": len(steps), "source": source, "metadata": metadata})
+    return jsonify(
+        {
+            "steps": steps,
+            "count": len(steps),
+            "source": source,
+            "metadata": metadata,
+            "recorder_resolution": recorder_resolution_status(steps),
+        }
+    )
 
 
 @app.route("/api/run", methods=["POST"])
@@ -5741,6 +5863,27 @@ def run_testcase():
     with _test_lock:
         if not _test_steps:
             return jsonify({"error": "Upload a test case first."}), 400
+        if _test_running:
+            return jsonify({"error": "A test case is already running."}), 409
+        steps = list(_test_steps)
+
+    if not check_device():
+        return jsonify({"error": "No adb device. Check USB connection and USB debugging."}), 409
+
+    try:
+        validate_recorder_resolution(steps)
+    except RecorderResolutionMismatch as exc:
+        return jsonify(
+            {
+                "error": str(exc),
+                "code": "recorder_resolution_mismatch",
+                "recorder_resolution": exc.status,
+            }
+        ), 409
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+
+    with _test_lock:
         if _test_running:
             return jsonify({"error": "A test case is already running."}), 409
         _test_running = True
