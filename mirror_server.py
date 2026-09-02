@@ -93,6 +93,7 @@ HEADER_ALIASES = {
     "screen_height": {"screen_height", "height", "record_height"},
     "description": {"description", "desc", "\uc124\uba85", "\ud14c\uc2a4\ud2b8\ub0b4\uc6a9", "test_case", "case"},
     "enabled": {"enabled", "use", "\uc0ac\uc6a9", "\uc2e4\ud589"},
+    "block_reason": {"block_reason", "block reason", "\ucc28\ub2e8\uc0ac\uc720", "\ucc28\ub2e8 \uc0ac\uc720"},
 }
 
 SUPPORTED_ACTIONS = {
@@ -824,28 +825,30 @@ def parse_wordp_testcase_excel(workbook):
     return steps
 
 
-def parse_excel(file_storage):
-    try:
-        from openpyxl import load_workbook
-    except ImportError as exc:
-        raise RuntimeError("openpyxl is not installed. Run setup_and_run.bat again.") from exc
+def find_automation_sheet(workbook):
+    for ws in workbook.worksheets:
+        if ws.title.strip().casefold() in {"automation", "\uc790\ub3d9\ud654"}:
+            return ws
+    return None
 
-    file_storage.stream.seek(0)
-    payload = file_storage.stream.read()
-    wb = load_workbook(io.BytesIO(payload), data_only=True)
-    manual_qa_steps = parse_manual_qa_excel(wb)
-    if manual_qa_steps is not None:
-        return manual_qa_steps
-    wordp_steps = parse_wordp_testcase_excel(wb)
-    if wordp_steps is not None:
-        return wordp_steps
 
-    ws = wb.active
+def parse_standard_excel_sheet(ws, source="testcase"):
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
-        raise ValueError("The Excel sheet is empty.")
+        raise ValueError(f"The '{ws.title}' sheet is empty.")
 
-    headers = [normalize_header(cell) for cell in rows[0]]
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows[:10])
+            if "action" in {normalize_header(cell) for cell in row}
+        ),
+        None,
+    )
+    if header_index is None:
+        raise ValueError(f"The '{ws.title}' sheet needs an Action column in its first 10 rows.")
+
+    headers = [normalize_header(cell) for cell in rows[header_index]]
     steps: list[dict[str, Any]] = []
     is_recorder_excel = {
         "action",
@@ -854,7 +857,7 @@ def parse_excel(file_storage):
         "screen_height",
     }.issubset(set(headers)) and {"x", "y", "x1", "y1", "x2", "y2"}.intersection(headers)
 
-    for row_index, row in enumerate(rows[1:], start=2):
+    for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
         record = {
             headers[col_index]: clean_cell(row[col_index]) if col_index < len(row) else ""
             for col_index in range(len(headers))
@@ -896,8 +899,11 @@ def parse_excel(file_storage):
             "delay_ms": record.get("delay_ms", ""),
             "screen_width": record.get("screen_width", ""),
             "screen_height": record.get("screen_height", ""),
-            "source": "recorder" if is_recorder_excel else "testcase",
+            "block_reason": str(record.get("block_reason", "") or "").strip(),
+            "source": "recorder" if is_recorder_excel else source,
         }
+        if action == "blocked" and not step["block_reason"]:
+            step["block_reason"] = step["description"] or "Blocked by Excel automation policy."
         if is_recorder_excel and not step["description"]:
             if action == "tap":
                 step["description"] = f"Recorder tap ({step['x']}, {step['y']})"
@@ -909,9 +915,33 @@ def parse_excel(file_storage):
         steps.append(step)
 
     if not steps:
-        raise ValueError("No executable test steps found.")
+        raise ValueError(f"No executable test steps found in '{ws.title}'.")
 
     return steps
+
+
+def parse_excel(file_storage):
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is not installed. Run setup_and_run.bat again.") from exc
+
+    file_storage.stream.seek(0)
+    payload = file_storage.stream.read()
+    wb = load_workbook(io.BytesIO(payload), data_only=True)
+
+    automation_sheet = find_automation_sheet(wb)
+    if automation_sheet is not None:
+        return parse_standard_excel_sheet(automation_sheet, source="automation")
+
+    manual_qa_steps = parse_manual_qa_excel(wb)
+    if manual_qa_steps is not None:
+        return manual_qa_steps
+    wordp_steps = parse_wordp_testcase_excel(wb)
+    if wordp_steps is not None:
+        return wordp_steps
+
+    return parse_standard_excel_sheet(wb.active)
 
 
 def int_value(value: Any, default: int | None = None):
@@ -1053,6 +1083,8 @@ def apply_recorder_delay(step):
 def testcase_source(steps):
     if steps and all(step.get("source") == "recorder" for step in steps):
         return "recorder"
+    if steps and all(step.get("source") == "automation" for step in steps):
+        return "automation"
     if steps and all(step.get("source") == "manual_qa" for step in steps):
         return "manual_qa"
     if steps and all(step.get("source") == "wordp_testcase" for step in steps):
@@ -4744,6 +4776,8 @@ HTML = r"""
       setTestRunning(false);
       statusLabel.textContent = data.source === 'recorder'
         ? `Loaded Recorder Excel: ${loadedSteps.length} steps`
+        : data.source === 'automation'
+          ? `Loaded Automation Excel: ${loadedSteps.length} steps`
         : data.source === 'manual_qa'
           ? `Loaded Manual QA Excel: ${loadedSteps.length} cases`
           : data.source === 'wordp_testcase'
