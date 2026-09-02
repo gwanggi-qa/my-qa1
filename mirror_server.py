@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +106,7 @@ SUPPORTED_ACTIONS = {
     "wait",
     "assert_text",
     "assert_not_text",
+    "assert_checked",
     "launch",
     "back",
     "home",
@@ -1343,6 +1345,59 @@ def find_ui_text_center(candidates):
                             "candidate": candidate,
                         }
     return find_ocr_text_center(candidates)
+
+
+def find_ui_checkable_state(candidates):
+    """Return the closest checkable UI node containing one of the visible labels."""
+    xml = dump_ui_xml()
+    if not xml:
+        return None
+
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+
+    def walk(node, ancestors):
+        attrs = node.attrib
+        values = (attrs.get("text", ""), attrs.get("content-desc", ""), attrs.get("resource-id", ""))
+        matched = next(
+            (
+                (candidate, value)
+                for candidate in candidates
+                for value in values
+                if text_value_matches(candidate, value)
+            ),
+            None,
+        )
+        if matched:
+            for parent in reversed([*ancestors, node]):
+                parent_attrs = parent.attrib
+                if parent_attrs.get("checkable") == "true":
+                    candidate, value = matched
+                    return {
+                        "candidate": candidate,
+                        "text": value,
+                        "checked": parent_attrs.get("checked") == "true",
+                        "bounds": parent_attrs.get("bounds", ""),
+                    }
+        for child in node:
+            result = walk(child, [*ancestors, node])
+            if result:
+                return result
+        return None
+
+    return walk(root, [])
+
+
+def wait_until_ui_checked(candidates, timeout_s=5.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        state = find_ui_checkable_state(candidates)
+        if state and state["checked"]:
+            return state
+        time.sleep(0.25)
+    return None
 
 
 def allows_unchanged_after_tap(step, text_hit):
@@ -3123,6 +3178,15 @@ def execute_step(step):
         if not wait_until_ui_contains(expected, timeout_s=5.0, should_exist=False):
             raise AssertionError(f"Unexpected text found: {expected}")
         return f"Text absent: {expected}"
+
+    if action == "assert_checked":
+        candidates = text_candidates_from_step(step)
+        if not candidates:
+            raise ValueError("assert_checked action needs a visible target label.")
+        state = wait_until_ui_checked(candidates, timeout_s=5.0)
+        if not state:
+            raise AssertionError(f"Checked UI state not found: {candidates[0]}")
+        return f"Checked state: {state['text']} at {state['bounds']}"
 
     if action == "launch":
         package = step.get("target") or step.get("value")
