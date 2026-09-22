@@ -61,12 +61,39 @@ AI 실행 이력은 `qa_results/ai_random_history.jsonl`에 저장되어 다음 
 UI 후보를 OpenAI API로 분석해 안전한 후보를 선택합니다.
 
 - 전체 Test Case 흐름 분석 후 25개 단위로 실행 힌트 생성
-- AI 복구 성공 결과는 Progress에 `ai-assisted`로 표시
+- 실행 전 화면의 전제조건과 실행 후 기대 문구를 UIAutomator/OCR로 각각 확인
+- 클릭 대상과 기대결과 후보를 분리해 기대 문구를 잘못 누르는 동작 방지
+- 실패 단계는 현재 화면을 다시 분석하며 최대 3회까지 안전한 후보로 복구
+- AI 힌트가 적용된 결과는 `ai-guided`, 복구 성공은 `ai-assisted`로 표시
+- Progress와 CSV에 AI 시도 횟수, 선택 이유, 검증 근거 표시
 - 결제, 삭제, 탈퇴, 초기화, 앱 제거, 시스템 설정 변경은 `Block(N/A)` 처리
 - API 키가 없거나 호출이 실패하면 기존 Test Case 실행으로 자동 전환
 - 실행 이력은 `qa_results/ai_testcase_history.jsonl`에 저장
 
 AI TC RUN은 위의 `OPENAI_API_KEY`와 `OPENAI_MODEL` 설정을 AI Random Run과 공유합니다.
+
+### Redmine 실패 이슈 검토
+
+Test Case 실행 중 `Fail`이 발생하면 스크린샷, 기대결과, 실제 오류, 재현 경로와
+기기/앱 정보를 `qa_results/redmine_failures.json`에 검토 대기 항목으로 저장합니다.
+`Test Case > Fail Review`에서 내용을 보완한 뒤에만 이슈를 만들거나 기존 Redmine
+이슈 번호를 연결합니다. 자동으로 이슈를 발행하지는 않습니다.
+
+Redmine 이슈 생성 기능은 서버를 실행하는 PowerShell에서 다음 환경변수를 설정한 뒤
+서버를 다시 시작해야 합니다. API 키는 브라우저나 결과 파일에 표시되지 않습니다.
+
+```powershell
+$env:REDMINE_URL="https://redmine.example.com"
+$env:REDMINE_API_KEY="YOUR_REDMINE_API_KEY"
+$env:REDMINE_PROJECT_ID="project-identifier"
+$env:REDMINE_TRACKER_ID="1"          # optional
+$env:REDMINE_DEFAULT_PRIORITY_ID="2" # optional
+$env:REDMINE_ASSIGNEE_ID="12"        # optional
+python mirror_server.py
+```
+
+실패 항목에 이슈를 연결한 뒤 같은 Excel을 다시 실행하면, 해당 Test Case의 최신
+Pass/Fail 결과가 연결된 검토 항목의 re-test 기록에 자동으로 추가됩니다.
 
 ### 미러링 FPS / 화질 — `mirror_server.py` 상단
 

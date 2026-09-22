@@ -37,6 +37,8 @@ RECORDINGS_DIR = BASE_DIR / "recordings"
 QA_RESULTS_DIR = BASE_DIR / "qa_results"
 AI_HISTORY_FILE = QA_RESULTS_DIR / "ai_random_history.jsonl"
 AI_TEST_HISTORY_FILE = QA_RESULTS_DIR / "ai_testcase_history.jsonl"
+TEST_RUN_HISTORY_FILE = QA_RESULTS_DIR / "test_run_history.jsonl"
+REDMINE_FAILURES_FILE = QA_RESULTS_DIR / "redmine_failures.json"
 OCR_LANGS = ["ko", "en"]
 OCR_MIN_CONFIDENCE = 0.35
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
@@ -44,6 +46,7 @@ OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/res
 AI_REQUEST_TIMEOUT_S = 45
 AI_HISTORY_LIMIT = 20
 AI_TEST_BATCH_SIZE = 25
+AI_TEST_MAX_RECOVERY_ATTEMPTS = 3
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "tablet-mirror-secret"
@@ -62,6 +65,8 @@ _random_running = False
 _random_stop_event = threading.Event()
 _random_last_plan: list[dict[str, Any]] = []
 _ai_history_lock = threading.Lock()
+_test_history_lock = threading.Lock()
+_redmine_failures_lock = threading.Lock()
 _record_play_lock = threading.Lock()
 _record_play_running = False
 _record_play_stop_event = threading.Event()
@@ -254,6 +259,12 @@ class BlockedStep(Exception):
 
 class RandomStopped(Exception):
     pass
+
+
+class AIRecoveryExhausted(RuntimeError):
+    def __init__(self, message, trace):
+        super().__init__(message)
+        self.trace = trace
 
 
 def adb(*args: str, timeout_s=None):
@@ -1257,19 +1268,8 @@ def parse_bounds(bounds):
     return x1, y1, x2, y2
 
 
-def text_candidates_from_step(step):
+def description_text_candidates(step):
     candidates: list[str] = []
-
-    for candidate_key in ("assert_candidates", "ai_target_candidates", "ai_expected_candidates"):
-        extra_candidates = step.get(candidate_key) or []
-        if isinstance(extra_candidates, list):
-            candidates.extend(str(value).strip() for value in extra_candidates if str(value or "").strip())
-
-    for key in ("target", "value", "expected"):
-        value = str(step.get(key) or "").strip()
-        if value and not looks_like_point(value) and not re.fullmatch(r"\d+(\.\d+)?", value):
-            candidates.append(value)
-
     description = str(step.get("description") or "").strip()
     if description:
         quoted = re.findall(r'"([^"]+)"', description) + re.findall(r"'([^']+)'", description)
@@ -1277,13 +1277,57 @@ def text_candidates_from_step(step):
         candidates.extend(part.strip() for part in [*quoted, *bracketed] if part.strip())
         if len(description) <= 40:
             candidates.append(description)
+    return candidates
 
+
+def unique_text_candidates(candidates):
     unique: list[str] = []
     for candidate in candidates:
-        candidate = re.sub(r"\s+", " ", candidate).strip()
+        candidate = re.sub(r"\s+", " ", str(candidate or "")).strip()
         if candidate and candidate not in unique:
             unique.append(candidate)
     return unique
+
+
+def target_candidates_from_step(step):
+    candidates: list[str] = []
+    ai_targets = step.get("ai_target_candidates") or []
+    if isinstance(ai_targets, list):
+        candidates.extend(str(value).strip() for value in ai_targets if str(value or "").strip())
+    for key in ("target", "value"):
+        value = str(step.get(key) or "").strip()
+        if value and not looks_like_point(value) and not re.fullmatch(r"\d+(\.\d+)?", value):
+            candidates.append(value)
+    candidates.extend(description_text_candidates(step))
+    candidates = unique_text_candidates(candidates)
+    if not candidates:
+        fallback = str(step.get("expected") or step.get("qa_expected") or "").strip()
+        if fallback and len(fallback) <= 120:
+            candidates.append(fallback)
+    return candidates
+
+
+def expected_candidates_from_step(step):
+    candidates: list[str] = []
+    for candidate_key in ("ai_expected_candidates", "assert_candidates"):
+        extra_candidates = step.get(candidate_key) or []
+        if isinstance(extra_candidates, list):
+            candidates.extend(str(value).strip() for value in extra_candidates if str(value or "").strip())
+    for key in ("expected", "qa_expected"):
+        value = str(step.get(key) or "").strip()
+        if value and len(value) <= 120:
+            candidates.append(value)
+    if step.get("action") in {"assert_text", "assert_not_text"} and not candidates:
+        fallback = str(step.get("value") or step.get("target") or "").strip()
+        if fallback:
+            candidates.append(fallback)
+    return unique_text_candidates(candidates)[:12]
+
+
+def text_candidates_from_step(step):
+    candidates = target_candidates_from_step(step)
+    candidates.extend(expected_candidates_from_step(step))
+    return unique_text_candidates(candidates)
 
 
 def text_value_matches(candidate, value):
@@ -1451,6 +1495,374 @@ def wait_until_any_ui_contains(candidates, timeout_s=5.0):
 def qa_results_dir():
     QA_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     return QA_RESULTS_DIR
+
+
+def append_test_run_history(record):
+    qa_results_dir()
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with _test_history_lock:
+        with TEST_RUN_HISTORY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+
+def redmine_config():
+    url = os.environ.get("REDMINE_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("REDMINE_API_KEY", "").strip()
+    project_id = os.environ.get("REDMINE_PROJECT_ID", "").strip()
+    return {
+        "url": url,
+        "api_key": api_key,
+        "project_id": project_id,
+        "tracker_id": os.environ.get("REDMINE_TRACKER_ID", "").strip(),
+        "priority_id": os.environ.get("REDMINE_DEFAULT_PRIORITY_ID", "").strip(),
+        "assigned_to_id": os.environ.get("REDMINE_ASSIGNEE_ID", "").strip(),
+        "configured": bool(url and api_key and project_id),
+    }
+
+
+def redmine_status_payload():
+    config = redmine_config()
+    return {
+        "configured": config["configured"],
+        "url": config["url"],
+        "project_id": config["project_id"],
+        "tracker_id": config["tracker_id"],
+        "priority_id": config["priority_id"],
+        "assigned_to_id": config["assigned_to_id"],
+        "message": (
+            "Ready for reviewer-created issues."
+            if config["configured"]
+            else "Set REDMINE_URL, REDMINE_API_KEY and REDMINE_PROJECT_ID on the server to create issues."
+        ),
+    }
+
+
+def _load_redmine_failures_unlocked():
+    if not REDMINE_FAILURES_FILE.exists():
+        return []
+    try:
+        data = json.loads(REDMINE_FAILURES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _write_redmine_failures_unlocked(items):
+    qa_results_dir()
+    temporary = REDMINE_FAILURES_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(REDMINE_FAILURES_FILE)
+
+
+def safe_redmine_failure_id(value):
+    failure_id = str(value or "").strip()
+    if not re.fullmatch(r"failure-[a-f0-9]{12}", failure_id):
+        raise ValueError("Invalid failure id.")
+    return failure_id
+
+
+def test_case_identity(step, index):
+    for key in ("tc_id", "case_id", "id", "step", "row"):
+        value = str(step.get(key) or "").strip()
+        if value:
+            return value
+    return f"step-{index}"
+
+
+def test_case_label(step, index):
+    return str(
+        step.get("description")
+        or step.get("expected")
+        or step.get("target")
+        or step.get("value")
+        or test_case_identity(step, index)
+    ).strip()
+
+
+def foreground_app_evidence():
+    focus = adb_text("shell", "dumpsys", "window", "windows")
+    match = re.search(r"mCurrentFocus=.*?\s([A-Za-z0-9_.]+)/", focus)
+    package = match.group(1) if match else ""
+    version = ""
+    if package:
+        package_info = adb_text("shell", "dumpsys", "package", package)
+        version_match = re.search(r"versionName=([^\s]+)", package_info)
+        if version_match:
+            version = version_match.group(1)
+    return {"package": package, "version": version, "focus": focus[:300]}
+
+
+def failure_device_evidence():
+    info = get_device_info()
+    app_info = foreground_app_evidence() if info.get("connected") else {}
+    return {
+        "model": " ".join(part for part in [info.get("manufacturer"), info.get("model")] if part).strip(),
+        "serial": info.get("serial", ""),
+        "android": info.get("android", ""),
+        "resolution": info.get("resolution", ""),
+        "density": info.get("density", ""),
+        "app_package": app_info.get("package", ""),
+        "app_version": app_info.get("version", ""),
+    }
+
+
+def default_reproduction_path(step, index):
+    action = str(step.get("action") or "").strip() or "action"
+    target = str(step.get("target") or step.get("value") or step.get("expected") or "").strip()
+    label = test_case_label(step, index)
+    lines = [f"1. Test Case {test_case_identity(step, index)}: {label}", f"2. Execute {action}{f' for {target}' if target else ''}."]
+    return "\n".join(lines)
+
+
+def redmine_related_issue(items, testcase_key, test_case_id):
+    for item in reversed(items):
+        if item.get("testcase_key") != testcase_key or item.get("test_case", {}).get("id") != test_case_id:
+            continue
+        redmine = item.get("redmine") or {}
+        if redmine.get("issue_id"):
+            return {
+                "issue_id": redmine.get("issue_id"),
+                "issue_url": redmine.get("issue_url", ""),
+                "failure_id": item.get("id", ""),
+            }
+    return None
+
+
+def queue_test_failure(run_id, index, total, step, message, elapsed_ms, extra, metadata, mode):
+    testcase_key = str(metadata.get("file_hash") or metadata.get("filename") or "current-testcase")
+    test_case_id = test_case_identity(step, index)
+    expected = str(step.get("expected") or step.get("qa_expected") or step.get("target") or step.get("value") or "").strip()
+    now = datetime.now().isoformat(timespec="seconds")
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        related_issue = redmine_related_issue(items, testcase_key, test_case_id)
+        record = {
+            "id": f"failure-{uuid.uuid4().hex[:12]}",
+            "status": "pending_review",
+            "created_at": now,
+            "updated_at": now,
+            "run": {
+                "id": run_id,
+                "mode": mode,
+                "filename": metadata.get("filename", ""),
+                "source": metadata.get("source", ""),
+                "file_hash": metadata.get("file_hash", ""),
+                "step_index": index,
+                "total_steps": total,
+                "elapsed_ms": elapsed_ms,
+            },
+            "testcase_key": testcase_key,
+            "test_case": {
+                "id": test_case_id,
+                "excel_row": step.get("row", ""),
+                "action": step.get("action", ""),
+                "target": step.get("target", ""),
+                "description": test_case_label(step, index),
+            },
+            "expected_result": expected,
+            "actual_result": str(message or ""),
+            "reproduction": default_reproduction_path(step, index),
+            "evidence": {
+                "screenshot_file": extra.get("screenshot_file", ""),
+                "screenshot_url": extra.get("screenshot_url", ""),
+                "screenshot_path": extra.get("screenshot", ""),
+            },
+            "device": failure_device_evidence(),
+            "redmine": related_issue or {},
+            "retests": [],
+        }
+        if related_issue:
+            record["related_issue"] = related_issue
+        items.append(record)
+        _write_redmine_failures_unlocked(items)
+    return record
+
+
+def record_linked_retest(metadata, step, index, status, message, extra=None):
+    testcase_key = str(metadata.get("file_hash") or metadata.get("filename") or "current-testcase")
+    test_case_id = test_case_identity(step, index)
+    event = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "status": status,
+        "message": str(message or ""),
+        "screenshot_url": (extra or {}).get("screenshot_url", ""),
+    }
+    updated = False
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        for item in items:
+            redmine = item.get("redmine") or {}
+            if item.get("testcase_key") != testcase_key or item.get("test_case", {}).get("id") != test_case_id or not redmine.get("issue_id"):
+                continue
+            item.setdefault("retests", []).append(event)
+            item["latest_retest"] = event
+            item["updated_at"] = event["at"]
+            updated = True
+        if updated:
+            _write_redmine_failures_unlocked(items)
+
+
+def list_redmine_failures():
+    with _redmine_failures_lock:
+        return list(reversed(_load_redmine_failures_unlocked()))
+
+
+def update_redmine_failure(failure_id, payload):
+    allowed_text = {
+        "subject": 255,
+        "expected_result": 6000,
+        "actual_result": 6000,
+        "reproduction": 8000,
+        "project_id": 120,
+        "tracker_id": 40,
+        "priority_id": 40,
+        "assigned_to_id": 40,
+    }
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        record = next((item for item in items if item.get("id") == failure_id), None)
+        if not record:
+            raise FileNotFoundError("Failure review item not found.")
+        review = record.setdefault("review", {})
+        for key, maximum in allowed_text.items():
+            if key in payload:
+                review[key] = str(payload.get(key) or "").strip()[:maximum]
+        if payload.get("status") in {"pending_review", "reviewed", "not_an_issue"}:
+            record["status"] = payload["status"]
+        record["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _write_redmine_failures_unlocked(items)
+        return record
+
+
+def redmine_api_json(method, path, payload=None, raw_data=None, content_type="application/json"):
+    config = redmine_config()
+    if not config["configured"]:
+        raise RuntimeError("Redmine is not configured on the server.")
+    data = raw_data if raw_data is not None else (json.dumps(payload).encode("utf-8") if payload is not None else None)
+    headers = {"X-Redmine-API-Key": config["api_key"], "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = content_type
+    request_obj = urllib.request.Request(f"{config['url']}{path}", data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request_obj, timeout=30) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:600]
+        raise RuntimeError(f"Redmine request failed ({exc.code}): {body or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Redmine connection failed: {exc.reason}") from exc
+    if not body:
+        return {}
+    try:
+        return json.loads(body)
+    except ValueError:
+        return {}
+
+
+def redmine_upload_screenshot(record):
+    filename = str((record.get("evidence") or {}).get("screenshot_file") or "")
+    if not filename or Path(filename).name != filename:
+        return None
+    path = qa_results_dir() / filename
+    if not path.exists():
+        return None
+    result = redmine_api_json(
+        "POST",
+        "/uploads.json",
+        raw_data=path.read_bytes(),
+        content_type="application/octet-stream",
+    )
+    token = str((result.get("upload") or {}).get("token") or "").strip()
+    if not token:
+        raise RuntimeError("Redmine did not return an attachment upload token.")
+    return {"token": token, "filename": filename, "content_type": "image/png"}
+
+
+def create_redmine_issue(failure_id, payload):
+    update_redmine_failure(failure_id, payload)
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        record = next((item for item in items if item.get("id") == failure_id), None)
+        if not record:
+            raise FileNotFoundError("Failure review item not found.")
+        if (record.get("redmine") or {}).get("issue_id"):
+            raise RuntimeError("This failure is already linked to a Redmine issue.")
+        snapshot = json.loads(json.dumps(record, ensure_ascii=False))
+
+    config = redmine_config()
+    if not config["configured"]:
+        raise RuntimeError("Redmine is not configured on the server.")
+    review = snapshot.get("review") or {}
+    test_case = snapshot.get("test_case") or {}
+    subject = str(review.get("subject") or f"[QA][{test_case.get('id', 'TC')}] {test_case.get('description', 'Test failure')}").replace("\n", " ").strip()[:255]
+    expected = str(review.get("expected_result") or snapshot.get("expected_result") or "Not recorded")
+    actual = str(review.get("actual_result") or snapshot.get("actual_result") or "Not recorded")
+    reproduction = str(review.get("reproduction") or snapshot.get("reproduction") or "Not recorded")
+    device = snapshot.get("device") or {}
+    description = "\n".join(
+        [
+            f"Test Case: {test_case.get('id', '')} / Row: {test_case.get('excel_row', '')}",
+            f"Action: {test_case.get('action', '')} / Target: {test_case.get('target', '')}",
+            "",
+            "Expected Result:", expected,
+            "",
+            "Actual Result:", actual,
+            "",
+            "Reproduction:", reproduction,
+            "",
+            "Environment:",
+            f"- Device: {device.get('model', '')} ({device.get('serial', '')})",
+            f"- Android: {device.get('android', '')} / Resolution: {device.get('resolution', '')}",
+            f"- App: {device.get('app_package', '')} {device.get('app_version', '')}".rstrip(),
+            f"- Captured at: {snapshot.get('created_at', '')}",
+        ]
+    )
+    issue = {"project_id": review.get("project_id") or config["project_id"], "subject": subject, "description": description}
+    for key in ("tracker_id", "priority_id", "assigned_to_id"):
+        value = str(review.get(key) or config[key] or "").strip()
+        if value:
+            if not value.isdigit():
+                raise ValueError(f"{key} must be a numeric Redmine id.")
+            issue[key] = int(value)
+    upload = redmine_upload_screenshot(snapshot)
+    if upload:
+        issue["uploads"] = [upload]
+    response = redmine_api_json("POST", "/issues.json", payload={"issue": issue})
+    issue_id = str((response.get("issue") or {}).get("id") or "").strip()
+    if not issue_id:
+        raise RuntimeError("Redmine did not return an issue id.")
+    issue_data = {"issue_id": issue_id, "issue_url": f"{config['url']}/issues/{issue_id}", "created_at": datetime.now().isoformat(timespec="seconds")}
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        record = next((item for item in items if item.get("id") == failure_id), None)
+        if not record:
+            raise FileNotFoundError("Failure review item not found.")
+        record["redmine"] = issue_data
+        record["status"] = "issued"
+        record["updated_at"] = issue_data["created_at"]
+        _write_redmine_failures_unlocked(items)
+        return record
+
+
+def link_redmine_issue(failure_id, payload):
+    issue_id = str(payload.get("issue_id") or "").strip()
+    if not issue_id.isdigit():
+        raise ValueError("issue_id must be a numeric Redmine issue id.")
+    update_redmine_failure(failure_id, payload)
+    config = redmine_config()
+    issue_url = str(payload.get("issue_url") or "").strip()
+    if not issue_url and config["url"]:
+        issue_url = f"{config['url']}/issues/{issue_id}"
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        record = next((item for item in items if item.get("id") == failure_id), None)
+        if not record:
+            raise FileNotFoundError("Failure review item not found.")
+        record["redmine"] = {"issue_id": issue_id, "issue_url": issue_url, "linked_at": datetime.now().isoformat(timespec="seconds")}
+        record["status"] = "linked"
+        record["updated_at"] = record["redmine"]["linked_at"]
+        _write_redmine_failures_unlocked(items)
+        return record
 
 
 def capture_failure_screenshot(run_type, index):
@@ -2110,6 +2522,7 @@ def compact_test_step(index, step):
         "target": str(step.get("target") or "")[:160],
         "value": str(step.get("value") or "")[:120],
         "expected": str(step.get("expected") or step.get("qa_expected") or "")[:220],
+        "precondition": str(step.get("precondition") or "")[:220],
         "description": str(step.get("description") or "")[:280],
         "block_reason": str(step.get("block_reason") or "")[:180],
     }
@@ -2230,6 +2643,7 @@ def request_ai_test_batch_hints(steps, start_index, overview, metadata):
                 {
                     "index": start_index,
                     "intent": "short intent",
+                    "precondition_candidates": ["visible text required before execution"],
                     "target_candidates": ["visible label"],
                     "expected_candidates": ["expected visible text"],
                     "risk": "safe or blocked",
@@ -2240,7 +2654,8 @@ def request_ai_test_batch_hints(steps, start_index, overview, metadata):
     }
     instructions = (
         "You are preparing execution hints for Android QA cases. Preserve every Excel index and action. "
-        "Extract concise visible labels that UIAutomator or OCR can match. Do not invent coordinates, input values, "
+        "Separate visible preconditions, action targets, and expected postconditions. Extract concise labels that "
+        "UIAutomator or OCR can match. Do not invent coordinates, input values, "
         "or additional actions. Mark destructive, account, payment, deletion, app removal, permission, system-setting, "
         "offline, or device-control cases as blocked. Return only JSON matching response_schema."
     )
@@ -2258,6 +2673,7 @@ def request_ai_test_batch_hints(steps, start_index, overview, metadata):
             continue
         hints[index] = {
             "intent": str(item.get("intent") or "")[:200],
+            "precondition_candidates": [str(value).strip()[:100] for value in (item.get("precondition_candidates") or [])[:6] if str(value or "").strip()],
             "target_candidates": [str(value).strip()[:100] for value in (item.get("target_candidates") or [])[:8] if str(value or "").strip()],
             "expected_candidates": [str(value).strip()[:100] for value in (item.get("expected_candidates") or [])[:8] if str(value or "").strip()],
             "risk": str(item.get("risk") or "safe").strip().lower(),
@@ -2271,6 +2687,7 @@ def apply_ai_test_hint(step, hint):
     if not hint:
         return enriched
     enriched["ai_hint"] = hint
+    enriched["ai_precondition_candidates"] = list(hint.get("precondition_candidates") or [])
     enriched["ai_target_candidates"] = list(hint.get("target_candidates") or [])
     enriched["ai_expected_candidates"] = list(hint.get("expected_candidates") or [])
     return enriched
@@ -2293,7 +2710,7 @@ def ai_test_screen_candidates():
     return candidates[:100], candidate_context
 
 
-def request_ai_test_recovery(index, step, original_error, overview, metadata):
+def request_ai_test_recovery(index, step, original_error, overview, metadata, attempt=1, prior_trace=None):
     candidates, candidate_context = ai_test_screen_candidates()
     if not candidates:
         raise RuntimeError("No safe current-screen candidates found for AI recovery")
@@ -2303,6 +2720,9 @@ def request_ai_test_recovery(index, step, original_error, overview, metadata):
         "suite_summary": overview.get("summary", ""),
         "failed_step": compact_test_step(index, step),
         "original_error": str(original_error)[:500],
+        "attempt": attempt,
+        "max_attempts": AI_TEST_MAX_RECOVERY_ATTEMPTS,
+        "prior_attempts": list(prior_trace or [])[-2:],
         "screen_candidates": candidate_context,
         "recent_runs": compact_ai_test_history(str(metadata.get("file_hash") or ""), limit=3),
         "response_schema": {
@@ -2310,12 +2730,15 @@ def request_ai_test_recovery(index, step, original_error, overview, metadata):
             "action": "tap, swipe, assert_text, wait, or input",
             "candidate_id": "c001 or blank",
             "wait_ms": 1000,
+            "goal_reached": False,
             "reason": "short reason",
         },
     }
     instructions = (
         "You are recovering one failed Android QA step using the attached current screenshot and the supplied "
-        "UIAutomator/OCR candidates. Select only an existing candidate_id; never invent coordinates. Input is allowed "
+        "UIAutomator/OCR candidates. Select the next single action that moves toward the failed step's intended "
+        "postcondition, or verify that the postcondition is already visible. Select only an existing candidate_id; "
+        "never invent coordinates. Use prior_attempts to avoid repeating an ineffective action. Input is allowed "
         "only when failed_step.value is non-empty. Return blocked for destructive, payment, deletion, account, app "
         "removal, permission, system-setting, offline, or device-control operations. Otherwise return execute or fail. "
         "Return only JSON matching response_schema."
@@ -2341,21 +2764,41 @@ def request_ai_test_recovery(index, step, original_error, overview, metadata):
         "candidate": candidate,
         "candidate_id": candidate_id,
         "wait_ms": wait_ms,
+        "goal_reached": bool(data.get("goal_reached", False)),
         "reason": str(data.get("reason") or "AI recovery")[:300],
         "usage": usage,
     }
 
 
 def ai_test_expected_candidates(step):
-    values: list[str] = []
-    for key in ("ai_expected_candidates", "assert_candidates"):
-        source_values = step.get(key) or []
-        if isinstance(source_values, list):
-            values.extend(str(value).strip() for value in source_values if str(value or "").strip())
-    expected = str(step.get("expected") or step.get("qa_expected") or "").strip()
-    if expected and len(expected) <= 120:
-        values.append(expected)
-    return list(dict.fromkeys(values))[:12]
+    return expected_candidates_from_step(step)
+
+
+def ai_test_precondition_candidates(step):
+    values = step.get("ai_precondition_candidates") or []
+    if not isinstance(values, list):
+        return []
+    return unique_text_candidates(values)[:8]
+
+
+def verify_ai_test_precondition(step):
+    candidates = ai_test_precondition_candidates(step)
+    if not candidates:
+        return ""
+    matched = wait_until_any_ui_contains(candidates, timeout_s=2.0)
+    if not matched:
+        raise AssertionError(f"AI precondition not found: {', '.join(candidates[:3])}")
+    return matched
+
+
+def verify_ai_test_postcondition(step, timeout_s=3.0):
+    candidates = ai_test_expected_candidates(step)
+    if not candidates:
+        return ""
+    matched = wait_until_any_ui_contains(candidates, timeout_s=timeout_s)
+    if not matched:
+        raise AssertionError(f"AI expected result not found: {', '.join(candidates[:3])}")
+    return matched
 
 
 def execute_ai_test_candidate(candidate):
@@ -2384,7 +2827,7 @@ def execute_ai_test_candidate(candidate):
     if rc:
         raise RuntimeError(err.decode(errors="ignore") or "AI-assisted ADB input failed")
     changed = wait_for_screen_change(before_hash, timeout_s=4.0, stop_event=_test_stop_event)
-    return f"{message}; {'screen changed' if changed else 'input sent'}"
+    return f"{message}; {'screen changed' if changed else 'input sent'}", changed
 
 
 def execute_ai_test_recovery(step, recovery):
@@ -2399,21 +2842,39 @@ def execute_ai_test_recovery(step, recovery):
     if action not in AI_TEST_ALLOWED_ACTIONS:
         raise RuntimeError(f"AI returned unsupported action: {action or 'blank'}")
     candidate = recovery.get("candidate")
+    expected_candidates = ai_test_expected_candidates(step)
+    evidence = {
+        "action": action,
+        "candidate_id": recovery.get("candidate_id", ""),
+        "candidate_label": str((candidate or {}).get("label") or ""),
+        "candidate_source": str((candidate or {}).get("source") or ""),
+        "reason": reason,
+        "verification": "",
+    }
 
     if action == "assert_text":
         if not candidate:
             raise RuntimeError("AI assert_text did not select a current-screen candidate")
+        label = str(candidate.get("label") or "")
+        if expected_candidates and not any(
+            text_value_matches(expected, label) or text_value_matches(label, expected)
+            for expected in expected_candidates
+        ):
+            raise AssertionError("AI selected visible text does not match the expected result")
         result = f"AI verified visible text '{candidate.get('label', '')}'"
+        evidence["verification"] = f"visible text matched: {label}"
     elif action in {"tap", "swipe"}:
         if not candidate or candidate.get("action") != action:
             raise RuntimeError("AI selected candidate does not match the requested action")
-        result = execute_ai_test_candidate(candidate)
+        result, changed = execute_ai_test_candidate(candidate)
+        evidence["verification"] = "screen changed" if changed else "screen unchanged"
     elif action == "input":
         value = str(step.get("value") or "").strip()
         if not value:
             raise RuntimeError("AI input recovery requires an Excel input value")
         if not candidate or candidate.get("action") != "tap":
             raise RuntimeError("AI input recovery requires a tappable field candidate")
+        before_hash = capture_screen_hash()
         with _adb_input_lock:
             _, tap_err, tap_rc = adb("shell", "input", "tap", str(candidate["x"]), str(candidate["y"]))
             if tap_rc:
@@ -2421,22 +2882,80 @@ def execute_ai_test_recovery(step, recovery):
             _, input_err, input_rc = adb("shell", "input", "text", adb_text_arg(value))
         if input_rc:
             raise RuntimeError(input_err.decode(errors="ignore") or "AI input failed")
+        changed = wait_for_screen_change(before_hash, timeout_s=3.0, stop_event=_test_stop_event)
         result = f"AI entered Excel value into '{candidate.get('label', '')}'"
+        evidence["verification"] = "screen changed after input" if changed else "input command accepted"
     else:
         deadline = time.time() + (recovery.get("wait_ms", 1000) / 1000)
         while time.time() < deadline:
             if _test_stop_event.is_set():
                 raise RuntimeError("Test Case stopped")
             time.sleep(min(0.1, max(0, deadline - time.time())))
-        result = execute_step(step)
+        result = f"AI waited {recovery.get('wait_ms', 1000)}ms"
+        evidence["verification"] = "screen observed again after wait"
 
-    expected_candidates = ai_test_expected_candidates(step)
-    if action in {"tap", "swipe", "input"} and expected_candidates:
-        matched = wait_until_any_ui_contains(expected_candidates, timeout_s=3.0)
+    if action in {"tap", "swipe", "input", "wait"} and expected_candidates:
+        matched = verify_ai_test_postcondition(step, timeout_s=3.0)
         if not matched:
             raise AssertionError("AI action completed but expected text was not found")
+        evidence["verification"] = f"expected text found: {matched}"
         result = f"{result}; found '{matched}'"
-    return f"ai-assisted: {reason}; {result}"
+    elif action in {"tap", "swipe"} and not changed:
+        raise AssertionError("AI action produced no screen change and no expected result was available")
+    elif action == "wait" and not expected_candidates:
+        raise AssertionError("AI wait has no expected result to verify")
+    return {"message": f"ai-assisted: {reason}; {result}", "evidence": evidence}
+
+
+def run_ai_test_recovery(index, step, original_error, overview, metadata):
+    trace: list[dict[str, Any]] = []
+    current_error = str(original_error)
+    for attempt in range(1, AI_TEST_MAX_RECOVERY_ATTEMPTS + 1):
+        if _test_stop_event.is_set():
+            raise RuntimeError("Test Case stopped")
+        emit_test_ai_status(
+            "assisting",
+            f"AI observing step {index}: attempt {attempt}/{AI_TEST_MAX_RECOVERY_ATTEMPTS}",
+            step=index,
+            attempt=attempt,
+            max_attempts=AI_TEST_MAX_RECOVERY_ATTEMPTS,
+        )
+        recovery = request_ai_test_recovery(
+            index,
+            step,
+            current_error,
+            overview,
+            metadata,
+            attempt=attempt,
+            prior_trace=trace,
+        )
+        trace_item = {
+            "attempt": attempt,
+            "decision": recovery.get("decision", ""),
+            "action": recovery.get("action", ""),
+            "candidate_id": recovery.get("candidate_id", ""),
+            "reason": recovery.get("reason", ""),
+            "status": "failed",
+        }
+        try:
+            result = execute_ai_test_recovery(step, recovery)
+        except BlockedStep:
+            trace_item["status"] = "blocked"
+            trace.append(trace_item)
+            raise
+        except Exception as exc:
+            current_error = str(exc)
+            trace_item["error"] = current_error[:400]
+            trace.append(trace_item)
+            continue
+        trace_item["status"] = "passed"
+        trace_item.update(result.get("evidence") or {})
+        trace.append(trace_item)
+        return {"message": result["message"], "trace": trace}
+    raise AIRecoveryExhausted(
+        f"AI recovery exhausted {AI_TEST_MAX_RECOVERY_ATTEMPTS} attempts: {current_error}",
+        trace,
+    )
 
 
 def detect_runtime_errors():
@@ -3060,7 +3579,7 @@ def execute_step(step):
 
     if action == "tap":
         before_hash = capture_screen_hash()
-        text_hit = find_ui_text_center(text_candidates_from_step(step))
+        text_hit = find_ui_text_center(target_candidates_from_step(step))
         if text_hit:
             x, y = text_hit["x"], text_hit["y"]
             source = f"text '{text_hit['text']}'"
@@ -3077,7 +3596,7 @@ def execute_step(step):
             if step.get("source") == "recorder":
                 return f"Tapped {source} at ({x}, {y}); recorder step sent"
             if step.get("source") in {"manual_qa", "wordp_testcase"}:
-                matched = wait_until_any_ui_contains(text_candidates_from_step(step), timeout_s=1.5)
+                matched = wait_until_any_ui_contains(expected_candidates_from_step(step), timeout_s=1.5)
                 if matched:
                     return f"Tapped {source} at ({x}, {y}); found '{matched}'"
             if text_hit and allows_unchanged_after_tap(step, text_hit):
@@ -3085,7 +3604,7 @@ def execute_step(step):
             raise AssertionError(f"Screen did not change after tap: {source}")
 
         if step.get("source") == "wordp_testcase":
-            candidates = text_candidates_from_step(step)
+            candidates = expected_candidates_from_step(step)
             if candidates:
                 matched = wait_until_any_ui_contains(candidates, timeout_s=2.0)
                 if not matched:
@@ -3162,14 +3681,11 @@ def execute_step(step):
         expected = step.get("expected") or step.get("value") or step.get("target")
         if not expected:
             raise ValueError("assert_text action needs expected/value/target.")
-        if step.get("source") in {"manual_qa", "wordp_testcase"}:
-            matched = wait_until_any_ui_contains(text_candidates_from_step(step), timeout_s=5.0)
-            if not matched:
-                raise AssertionError(f"Text not found: {expected}")
-            return f"Found text: {matched}"
-        if not wait_until_ui_contains(expected, timeout_s=5.0, should_exist=True):
+        candidates = expected_candidates_from_step(step) or [str(expected)]
+        matched = wait_until_any_ui_contains(candidates, timeout_s=5.0)
+        if not matched:
             raise AssertionError(f"Text not found: {expected}")
-        return f"Found text: {expected}"
+        return f"Found text: {matched}"
 
     if action == "assert_not_text":
         expected = step.get("expected") or step.get("value") or step.get("target")
@@ -3180,7 +3696,7 @@ def execute_step(step):
         return f"Text absent: {expected}"
 
     if action == "assert_checked":
-        candidates = text_candidates_from_step(step)
+        candidates = target_candidates_from_step(step)
         if not candidates:
             raise ValueError("assert_checked action needs a visible target label.")
         state = wait_until_ui_checked(candidates, timeout_s=5.0)
@@ -3318,13 +3834,26 @@ def run_test_steps(ai_mode=False):
                 continue
 
             try:
+                precondition_match = verify_ai_test_precondition(active_step) if ai_active else ""
                 delay_ms = apply_recorder_delay(active_step)
                 message = execute_step(active_step)
                 if delay_ms:
                     message = f"Waited {delay_ms}ms; {message}"
+                postcondition_match = ""
+                if ai_active and active_step.get("action") in {"tap", "swipe", "input", "text"}:
+                    postcondition_match = verify_ai_test_postcondition(active_step)
+                    if postcondition_match:
+                        message = f"{message}; AI verified expected '{postcondition_match}'"
+                ai_guided = bool(ai_active and active_step.get("ai_hint"))
+                if ai_guided:
+                    intent = str((active_step.get("ai_hint") or {}).get("intent") or "AI execution hint")
+                    message = f"ai-guided: {intent}; {message}"
                 elapsed_ms = int((time.time() - started) * 1000)
                 passed += 1
-                run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": False})
+                if ai_guided:
+                    ai_assisted += 1
+                run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": ai_guided})
+                record_linked_retest(metadata, active_step, index, "passed", message)
                 emit_progress(
                     StepResult(
                         index=index,
@@ -3333,69 +3862,51 @@ def run_test_steps(ai_mode=False):
                         step=active_step,
                         message=message,
                         elapsed_ms=elapsed_ms,
+                        extra={
+                            "ai_assisted": ai_guided,
+                            "ai_hint": active_step.get("ai_hint", {}),
+                            "ai_precondition": precondition_match,
+                            "ai_verification": postcondition_match,
+                        } if ai_mode else {},
                     )
                 )
             except BlockedStep as exc:
                 original_error = str(exc)
-                recovered = False
-                recovery_error = ""
-                if ai_active:
-                    emit_test_ai_status("assisting", f"AI assisting Test Case step {index}", step=index)
-                    try:
-                        recovery = request_ai_test_recovery(index, active_step, original_error, ai_overview, metadata)
-                    except Exception as ai_exc:
-                        ai_active = False
-                        ai_fallback = True
-                        recovery_error = str(ai_exc)
-                        emit_test_ai_status("fallback", f"AI recovery unavailable; continuing standard execution: {ai_exc}")
-                    else:
-                        if _test_stop_event.is_set():
-                            break
-                        try:
-                            message = execute_ai_test_recovery(active_step, recovery)
-                            recovered = True
-                        except Exception as recovery_exc:
-                            recovery_error = str(recovery_exc)
-
                 elapsed_ms = int((time.time() - started) * 1000)
-                if recovered:
-                    passed += 1
-                    ai_assisted += 1
-                    run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": True})
-                    emit_progress(
-                        StepResult(
-                            index=index,
-                            total=total,
-                            status="passed",
-                            step=active_step,
-                            message=message,
-                            elapsed_ms=elapsed_ms,
-                            extra={"ai_assisted": True, "ai_hint": active_step.get("ai_hint", {})},
-                        )
+                blocked += 1
+                run_results.append({"index": index, "status": "blocked", "message": original_error, "ai_assisted": False})
+                emit_progress(
+                    StepResult(
+                        index=index,
+                        total=total,
+                        status="blocked",
+                        step=active_step,
+                        message=original_error,
+                        elapsed_ms=elapsed_ms,
+                        extra={"ai_hint": active_step.get("ai_hint", {})} if ai_mode else {},
                     )
-                else:
-                    blocked += 1
-                    message = original_error if not recovery_error else f"{original_error}; AI: {recovery_error}"
-                    run_results.append({"index": index, "status": "blocked", "message": message, "ai_assisted": False})
-                    emit_progress(
-                        StepResult(
-                            index=index,
-                            total=total,
-                            status="blocked",
-                            step=active_step,
-                            message=message,
-                            elapsed_ms=elapsed_ms,
-                        )
-                    )
+                )
             except Exception as exc:
                 original_error = str(exc)
                 recovered = False
                 recovery_blocked = False
                 recovery_error = ""
+                ai_trace: list[dict[str, Any]] = []
                 if ai_active:
-                    emit_test_ai_status("assisting", f"AI assisting Test Case step {index}", step=index)
                     try:
-                        recovery = request_ai_test_recovery(index, active_step, original_error, ai_overview, metadata)
+                        recovery_result = run_ai_test_recovery(
+                            index,
+                            active_step,
+                            original_error,
+                            ai_overview,
+                            metadata,
+                        )
+                    except AIRecoveryExhausted as recovery_exc:
+                        recovery_error = str(recovery_exc)
+                        ai_trace = recovery_exc.trace
+                    except BlockedStep as recovery_exc:
+                        recovery_blocked = True
+                        recovery_error = str(recovery_exc)
                     except Exception as ai_exc:
                         ai_active = False
                         ai_fallback = True
@@ -3404,20 +3915,16 @@ def run_test_steps(ai_mode=False):
                     else:
                         if _test_stop_event.is_set():
                             break
-                        try:
-                            message = execute_ai_test_recovery(active_step, recovery)
-                            recovered = True
-                        except BlockedStep as recovery_exc:
-                            recovery_blocked = True
-                            recovery_error = str(recovery_exc)
-                        except Exception as recovery_exc:
-                            recovery_error = str(recovery_exc)
+                        message = recovery_result["message"]
+                        ai_trace = recovery_result["trace"]
+                        recovered = True
 
                 elapsed_ms = int((time.time() - started) * 1000)
                 if recovered:
                     passed += 1
                     ai_assisted += 1
-                    run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": True})
+                    run_results.append({"index": index, "status": "passed", "message": message, "ai_assisted": True, "ai_trace": ai_trace})
+                    record_linked_retest(metadata, active_step, index, "passed", message)
                     emit_progress(
                         StepResult(
                             index=index,
@@ -3426,13 +3933,13 @@ def run_test_steps(ai_mode=False):
                             step=active_step,
                             message=message,
                             elapsed_ms=elapsed_ms,
-                            extra={"ai_assisted": True, "ai_hint": active_step.get("ai_hint", {})},
+                            extra={"ai_assisted": True, "ai_hint": active_step.get("ai_hint", {}), "ai_trace": ai_trace},
                         )
                     )
                 elif recovery_blocked:
                     blocked += 1
                     message = f"{original_error}; {recovery_error}"
-                    run_results.append({"index": index, "status": "blocked", "message": message, "ai_assisted": False})
+                    run_results.append({"index": index, "status": "blocked", "message": message, "ai_assisted": False, "ai_trace": ai_trace})
                     emit_progress(
                         StepResult(
                             index=index,
@@ -3441,15 +3948,47 @@ def run_test_steps(ai_mode=False):
                             step=active_step,
                             message=message,
                             elapsed_ms=elapsed_ms,
+                            extra={"ai_trace": ai_trace, "ai_hint": active_step.get("ai_hint", {})},
                         )
                     )
                 else:
                     failed += 1
                     message = original_error if not recovery_error else f"{original_error}; AI: {recovery_error}"
-                    run_results.append({"index": index, "status": "failed", "message": message, "ai_assisted": False})
                     extra = failure_extra("testcase-ai" if ai_mode else "testcase", index)
+                    failure = None
+                    try:
+                        failure = queue_test_failure(
+                            run_id,
+                            index,
+                            total,
+                            active_step,
+                            message,
+                            elapsed_ms,
+                            extra,
+                            metadata,
+                            mode,
+                        )
+                        extra["redmine_failure_id"] = failure["id"]
+                        if (failure.get("redmine") or {}).get("issue_id"):
+                            extra["redmine_issue_id"] = failure["redmine"]["issue_id"]
+                    except Exception as queue_exc:
+                        extra["redmine_queue_error"] = str(queue_exc)
+                    run_results.append(
+                        {
+                            "index": index,
+                            "status": "failed",
+                            "message": message,
+                            "ai_assisted": False,
+                            "ai_trace": ai_trace,
+                            "failure_id": failure["id"] if failure else "",
+                        }
+                    )
+                    try:
+                        record_linked_retest(metadata, active_step, index, "failed", message, extra)
+                    except Exception:
+                        pass
                     if ai_mode:
-                        extra.update({"ai_assisted": False, "ai_hint": active_step.get("ai_hint", {})})
+                        extra.update({"ai_assisted": False, "ai_hint": active_step.get("ai_hint", {}), "ai_trace": ai_trace})
                     emit_progress(
                         StepResult(
                             index=index,
@@ -3464,6 +4003,24 @@ def run_test_steps(ai_mode=False):
     except Exception as exc:
         socketio.emit("test_error", {"msg": str(exc)}, namespace="/mirror")
     finally:
+        try:
+            append_test_run_history(
+                {
+                    "run_id": run_id,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "filename": metadata.get("filename", ""),
+                    "file_hash": metadata.get("file_hash", ""),
+                    "source": metadata.get("source", ""),
+                    "mode": mode,
+                    "total": total,
+                    "passed": passed,
+                    "failed": failed,
+                    "blocked": blocked,
+                    "results": run_results,
+                }
+            )
+        except OSError:
+            pass
         if ai_mode:
             try:
                 append_ai_test_history(
@@ -3692,6 +4249,7 @@ HTML = r"""
     .btn-upload { background: var(--blue); }
     .btn-run { background: #5b63c7; }
     .btn-ai-test { background: #355bc1; }
+    .btn-redmine { background: #8f5a2c; }
     .btn-random-dry { background: #6b7280; }
     .btn-random-dry.active { background: var(--accent); }
     .btn-random-live { background: #ad6b2d; }
@@ -3726,6 +4284,7 @@ HTML = r"""
     .icon-run::before,
     .icon-play::before { content: ">"; }
     .icon-ai-test::before { content: "AI"; font-size: 10px; }
+    .icon-redmine::before { content: "!"; }
     .icon-dry::before { content: "M"; }
     .icon-live::before { content: ">"; }
     .icon-ai::before { content: "AI"; font-size: 10px; }
@@ -3793,6 +4352,205 @@ HTML = r"""
       color: #ffd39a;
       border-color: rgba(217, 164, 65, .72);
       background: rgba(217, 164, 65, .16);
+    }
+
+    .redmine-review-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 34px;
+      padding: 6px 8px;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .redmine-review-bar button {
+      flex: 0 0 auto;
+      height: 28px;
+      padding: 0 9px;
+      font-size: 11px;
+    }
+
+    .review-modal-backdrop[hidden] {
+      display: none;
+    }
+
+    .review-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      background: rgba(0, 0, 0, .72);
+    }
+
+    .review-modal {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      width: min(1060px, 100%);
+      max-height: min(780px, 100%);
+      overflow: hidden;
+      border: 1px solid #46505f;
+      border-radius: 6px;
+      background: #161920;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, .55);
+    }
+
+    .review-modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 52px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+
+    .review-modal-header h2 {
+      margin: 0;
+      font-size: 15px;
+    }
+
+    .review-modal-header button {
+      width: 32px;
+      height: 32px;
+      background: #3d4350;
+    }
+
+    .review-modal-body {
+      display: grid;
+      grid-template-columns: minmax(220px, .8fr) minmax(0, 1.4fr);
+      min-height: 0;
+    }
+
+    .failure-review-list {
+      min-height: 0;
+      overflow-y: auto;
+      padding: 10px;
+      border-right: 1px solid var(--line);
+    }
+
+    .failure-review-item {
+      display: block;
+      width: 100%;
+      height: auto;
+      margin-bottom: 8px;
+      padding: 10px;
+      border: 1px solid #353b46;
+      border-radius: 6px;
+      background: #101217;
+      color: var(--text);
+      text-align: left;
+      white-space: normal;
+    }
+
+    .failure-review-item.active {
+      border-color: #6f8fe2;
+      background: rgba(53, 91, 193, .2);
+    }
+
+    .failure-review-item strong,
+    .failure-review-item span {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .failure-review-item span {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .failure-review-detail {
+      min-height: 0;
+      overflow-y: auto;
+      padding: 14px;
+    }
+
+    .review-status-line {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .review-status-line a {
+      color: #8ec5ff;
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .review-fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .review-field {
+      min-width: 0;
+    }
+
+    .review-field.wide {
+      grid-column: 1 / -1;
+    }
+
+    .review-field label {
+      display: block;
+      margin: 0 0 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 74px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0c0e13;
+      color: var(--text);
+      outline: none;
+      padding: 8px 10px;
+      font: inherit;
+      line-height: 1.35;
+    }
+
+    .review-actions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .review-actions button {
+      font-size: 12px;
+    }
+
+    @media (max-width: 700px) {
+      .review-modal-body {
+        grid-template-columns: 1fr;
+      }
+
+      .failure-review-list {
+        max-height: 180px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .review-fields {
+        grid-template-columns: 1fr;
+      }
     }
 
     .tab-bar {
@@ -4331,6 +5089,10 @@ HTML = r"""
           </div>
           <div class="test-ai-state" id="test-ai-state">AI TC: Checking</div>
           <div class="test-resolution-state" id="test-resolution-state" hidden></div>
+          <div class="redmine-review-bar">
+            <span id="redmine-review-status">Fail review: checking</span>
+            <button class="btn-redmine" id="btn-redmine-review" type="button" onclick="openRedmineReview()"><span class="ui-icon icon-redmine" aria-hidden="true"></span>Fail Review <span id="redmine-failure-count">0</span></button>
+          </div>
           <section class="case-panel" aria-label="Uploaded test cases">
             <div class="panel-head">
               <span>Uploaded Test Case</span>
@@ -4460,6 +5222,23 @@ HTML = r"""
     </section>
   </main>
 
+  <div class="review-modal-backdrop" id="redmine-review-modal" hidden>
+    <section class="review-modal" role="dialog" aria-modal="true" aria-labelledby="redmine-review-title">
+      <header class="review-modal-header">
+        <h2 id="redmine-review-title">Fail Review / Redmine</h2>
+        <button type="button" onclick="closeRedmineReview()" aria-label="Close fail review">x</button>
+      </header>
+      <div class="review-modal-body">
+        <div class="failure-review-list" id="redmine-failure-list">
+          <div class="empty">No failure evidence recorded.</div>
+        </div>
+        <div class="failure-review-detail" id="redmine-failure-detail">
+          <div class="empty">Select a failed Test Case result to review its evidence.</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <script>
     const socket = io('/mirror');
@@ -4473,6 +5252,11 @@ HTML = r"""
     const testStopButton = document.getElementById('btn-test-stop');
     const testAiState = document.getElementById('test-ai-state');
     const testResolutionState = document.getElementById('test-resolution-state');
+    const redmineReviewStatus = document.getElementById('redmine-review-status');
+    const redmineFailureCount = document.getElementById('redmine-failure-count');
+    const redmineReviewModal = document.getElementById('redmine-review-modal');
+    const redmineFailureList = document.getElementById('redmine-failure-list');
+    const redmineFailureDetail = document.getElementById('redmine-failure-detail');
     const caseList = document.getElementById('case-list');
     const caseCount = document.getElementById('case-count');
     const progressList = document.getElementById('progress-list');
@@ -4542,6 +5326,9 @@ HTML = r"""
     let isPlayingRecording = false;
     let recordingScreenWidth = 0;
     let recordingScreenHeight = 0;
+    let redmineFailures = [];
+    let selectedRedmineFailureId = '';
+    let redmineConfig = {};
     const defaultProgressHeight = 240;
     const minProgressHeight = 150;
     const minMirrorStageHeight = 140;
@@ -4556,6 +5343,7 @@ HTML = r"""
       refreshRecordings();
       refreshOcrStatus();
       refreshAiStatus();
+      refreshRedmineReview();
     });
 
     socket.on('disconnect', () => {
@@ -4620,6 +5408,9 @@ HTML = r"""
     socket.on('test_progress', (data) => {
       upsertProgress(data);
       updateRunSummary(data.index, data.total);
+      if (data.status === 'failed') {
+        refreshRedmineReview();
+      }
     });
 
     socket.on('test_error', (data) => {
@@ -4631,7 +5422,7 @@ HTML = r"""
       const labels = {
         analyzing: 'AI TC: Analyzing',
         executing: 'AI TC: Executing',
-        assisting: `AI TC: Assisting${data.step ? ` step ${data.step}` : ''}`,
+        assisting: `AI TC: Assisting${data.step ? ` step ${data.step}` : ''}${data.attempt ? ` (${data.attempt}/${data.max_attempts || 3})` : ''}`,
         fallback: 'AI TC: Fallback',
         done: 'AI TC: Done'
       };
@@ -4655,6 +5446,7 @@ HTML = r"""
       isPlayingRecording = false;
       updateRecorderControls();
       refreshAiStatus();
+      refreshRedmineReview();
     });
 
     function randomModeLabel(mode) {
@@ -4784,6 +5576,213 @@ HTML = r"""
         testAiState.textContent = 'AI TC: Unknown';
         testAiState.classList.remove('active');
       }
+    }
+
+    async function refreshRedmineReview() {
+      try {
+        const response = await fetch('/api/redmine/failures');
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to load fail review');
+        }
+        redmineFailures = data.failures || [];
+        redmineConfig = data.redmine || {};
+        renderRedmineReview();
+      } catch (error) {
+        redmineReviewStatus.textContent = 'Fail review: unavailable';
+      }
+    }
+
+    function redmineFailureTitle(item) {
+      const testCase = item.test_case || {};
+      return `[${testCase.id || 'TC'}] ${testCase.description || item.actual_result || 'Test failure'}`;
+    }
+
+    function redmineFailureState(item) {
+      const redmine = item.redmine || {};
+      if (redmine.issue_id) return `Issue #${redmine.issue_id}`;
+      if (item.status === 'reviewed') return 'Reviewed';
+      if (item.status === 'not_an_issue') return 'Not an issue';
+      return 'Pending review';
+    }
+
+    function renderRedmineReview() {
+      const pending = redmineFailures.filter((item) => !(item.redmine || {}).issue_id && item.status !== 'not_an_issue').length;
+      const linked = redmineFailures.filter((item) => (item.redmine || {}).issue_id).length;
+      redmineFailureCount.textContent = pending;
+      redmineReviewStatus.textContent = redmineConfig.configured
+        ? `Fail review: ${pending} pending / ${linked} linked`
+        : `Fail review: ${pending} pending / Redmine configuration required`;
+
+      if (!redmineFailures.length) {
+        redmineFailureList.innerHTML = '<div class="empty">No failed Test Case evidence recorded.</div>';
+        redmineFailureDetail.innerHTML = '<div class="empty">Run a Test Case. Failed steps will appear here with their capture and context.</div>';
+        return;
+      }
+      if (!redmineFailures.some((item) => item.id === selectedRedmineFailureId)) {
+        selectedRedmineFailureId = redmineFailures[0].id;
+      }
+      redmineFailureList.innerHTML = redmineFailures.map((item) => `
+        <button class="failure-review-item ${item.id === selectedRedmineFailureId ? 'active' : ''}" type="button" onclick="selectRedmineFailure('${escapeHtml(item.id)}')">
+          <strong title="${escapeHtml(redmineFailureTitle(item))}">${escapeHtml(redmineFailureTitle(item))}</strong>
+          <span>${escapeHtml(redmineFailureState(item))} · ${escapeHtml(item.created_at || '')}</span>
+        </button>
+      `).join('');
+      renderSelectedRedmineFailure();
+    }
+
+    function selectRedmineFailure(failureId) {
+      selectedRedmineFailureId = failureId;
+      renderRedmineReview();
+    }
+
+    function renderSelectedRedmineFailure() {
+      const item = redmineFailures.find((candidate) => candidate.id === selectedRedmineFailureId);
+      if (!item) {
+        return;
+      }
+      const testCase = item.test_case || {};
+      const evidence = item.evidence || {};
+      const device = item.device || {};
+      const review = item.review || {};
+      const redmine = item.redmine || {};
+      const related = item.related_issue || {};
+      const latestRetest = item.latest_retest || {};
+      const defaultSubject = `[QA][${testCase.id || 'TC'}] ${testCase.description || 'Test failure'}`;
+      const screenshot = evidence.screenshot_url
+        ? `<a href="${escapeHtml(evidence.screenshot_url)}" target="_blank" rel="noopener noreferrer">Open failure capture</a>`
+        : 'No capture available';
+      const issueLink = redmine.issue_id
+        ? (redmine.issue_url ? `<a href="${escapeHtml(redmine.issue_url)}" target="_blank" rel="noopener noreferrer">Redmine #${escapeHtml(redmine.issue_id)}</a>` : `Redmine #${escapeHtml(redmine.issue_id)}`)
+        : (related.issue_id ? `Existing related issue: #${escapeHtml(related.issue_id)}` : 'Not linked');
+      const retestText = latestRetest.at
+        ? `Latest re-test: ${latestRetest.status} at ${latestRetest.at}`
+        : 'Re-test results are added automatically when the same Test Case is run after this item is linked.';
+      redmineFailureDetail.innerHTML = `
+        <div class="review-status-line">
+          <strong>${escapeHtml(redmineFailureTitle(item))}</strong><br>
+          Status: ${escapeHtml(redmineFailureState(item))} · ${issueLink}<br>
+          Evidence: ${screenshot}<br>
+          ${escapeHtml(retestText)}
+        </div>
+        <div class="review-fields">
+          <div class="review-field wide">
+            <label for="redmine-subject">Issue title</label>
+            <input id="redmine-subject" value="${escapeHtml(review.subject || defaultSubject)}" maxlength="255">
+          </div>
+          <div class="review-field wide">
+            <label for="redmine-expected">Expected result</label>
+            <textarea id="redmine-expected">${escapeHtml(review.expected_result || item.expected_result || '')}</textarea>
+          </div>
+          <div class="review-field wide">
+            <label for="redmine-actual">Actual result / error</label>
+            <textarea id="redmine-actual">${escapeHtml(review.actual_result || item.actual_result || '')}</textarea>
+          </div>
+          <div class="review-field wide">
+            <label for="redmine-reproduction">Reproduction path</label>
+            <textarea id="redmine-reproduction">${escapeHtml(review.reproduction || item.reproduction || '')}</textarea>
+          </div>
+          <div class="review-field">
+            <label for="redmine-project-id">Project ID</label>
+            <input id="redmine-project-id" value="${escapeHtml(review.project_id || redmineConfig.project_id || '')}" placeholder="Redmine project identifier">
+          </div>
+          <div class="review-field">
+            <label for="redmine-tracker-id">Tracker ID</label>
+            <input id="redmine-tracker-id" value="${escapeHtml(review.tracker_id || redmineConfig.tracker_id || '')}" placeholder="Optional numeric ID">
+          </div>
+          <div class="review-field">
+            <label for="redmine-priority-id">Priority ID</label>
+            <input id="redmine-priority-id" value="${escapeHtml(review.priority_id || redmineConfig.priority_id || '')}" placeholder="Optional numeric ID">
+          </div>
+          <div class="review-field">
+            <label for="redmine-assignee-id">Assignee ID</label>
+            <input id="redmine-assignee-id" value="${escapeHtml(review.assigned_to_id || redmineConfig.assigned_to_id || '')}" placeholder="Optional numeric ID">
+          </div>
+          <div class="review-field wide">
+            <label for="redmine-existing-issue">Existing Redmine issue ID</label>
+            <input id="redmine-existing-issue" value="${escapeHtml(redmine.issue_id || related.issue_id || '')}" placeholder="Link to an existing issue instead of creating a new one">
+          </div>
+        </div>
+        <div class="review-actions">
+          <button class="btn-secondary" type="button" onclick="saveRedmineReview()">Save review</button>
+          <button class="btn-redmine" type="button" onclick="linkExistingRedmineIssue()">Link existing</button>
+          <button class="btn-run" type="button" onclick="createRedmineIssue()" ${redmine.issue_id ? 'disabled' : ''}>Create issue</button>
+        </div>
+        <div class="review-status-line">Environment: ${escapeHtml(device.model || '-')} · Android ${escapeHtml(device.android || '-')} · ${escapeHtml(device.resolution || '-')} · ${escapeHtml(device.app_package || '-')} ${escapeHtml(device.app_version || '')}</div>
+      `;
+    }
+
+    function redmineReviewPayload() {
+      const value = (id) => document.getElementById(id)?.value || '';
+      return {
+        subject: value('redmine-subject'),
+        expected_result: value('redmine-expected'),
+        actual_result: value('redmine-actual'),
+        reproduction: value('redmine-reproduction'),
+        project_id: value('redmine-project-id'),
+        tracker_id: value('redmine-tracker-id'),
+        priority_id: value('redmine-priority-id'),
+        assigned_to_id: value('redmine-assignee-id'),
+        status: 'reviewed'
+      };
+    }
+
+    async function saveRedmineReview() {
+      if (!selectedRedmineFailureId) return;
+      const response = await fetch(`/api/redmine/failures/${encodeURIComponent(selectedRedmineFailureId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(redmineReviewPayload())
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        statusLabel.textContent = data.error || 'Could not save fail review';
+        return;
+      }
+      statusLabel.textContent = 'Fail review saved';
+      await refreshRedmineReview();
+    }
+
+    async function linkExistingRedmineIssue() {
+      if (!selectedRedmineFailureId) return;
+      const issueId = document.getElementById('redmine-existing-issue')?.value || '';
+      const response = await fetch(`/api/redmine/failures/${encodeURIComponent(selectedRedmineFailureId)}/link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...redmineReviewPayload(), issue_id: issueId })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        statusLabel.textContent = data.error || 'Could not link Redmine issue';
+        return;
+      }
+      statusLabel.textContent = `Linked Redmine #${data.failure.redmine.issue_id}`;
+      await refreshRedmineReview();
+    }
+
+    async function createRedmineIssue() {
+      if (!selectedRedmineFailureId) return;
+      const response = await fetch(`/api/redmine/failures/${encodeURIComponent(selectedRedmineFailureId)}/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(redmineReviewPayload())
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        statusLabel.textContent = data.error || 'Could not create Redmine issue';
+        return;
+      }
+      statusLabel.textContent = `Created Redmine #${data.failure.redmine.issue_id}`;
+      await refreshRedmineReview();
+    }
+
+    async function openRedmineReview() {
+      redmineReviewModal.hidden = false;
+      await refreshRedmineReview();
+    }
+
+    function closeRedmineReview() {
+      redmineReviewModal.hidden = true;
     }
 
     function renderDeviceInfo(data) {
@@ -5631,7 +6630,12 @@ HTML = r"""
       const step = data.step || {};
       const label = step.description || step.expected || step.target || step.value || '-';
       const screenshot = data.extra && data.extra.screenshot ? ` ??screenshot: ${data.extra.screenshot}` : '';
-      const message = `${data.message || label}${screenshot}`;
+      const aiTrace = data.extra && Array.isArray(data.extra.ai_trace) ? data.extra.ai_trace : [];
+      const lastAiAttempt = aiTrace.length ? aiTrace[aiTrace.length - 1] : null;
+      const aiDecision = lastAiAttempt
+        ? ` | AI ${aiTrace.length}/${lastAiAttempt.attempt || aiTrace.length}: ${lastAiAttempt.reason || lastAiAttempt.action || lastAiAttempt.status}${lastAiAttempt.verification ? `; ${lastAiAttempt.verification}` : ''}`
+        : (data.extra && data.extra.ai_assisted ? ' | AI guided' : '');
+      const message = `${data.message || label}${aiDecision}${screenshot}`;
       const screenshotUrl = data.extra && data.extra.screenshot_url ? data.extra.screenshot_url : '';
       const screenshotLink = screenshotUrl
         ? ` <a class="result-link" href="${escapeHtml(screenshotUrl)}" target="_blank" rel="noopener noreferrer">Open</a>`
@@ -5666,6 +6670,9 @@ HTML = r"""
         'target',
         'expected',
         'elapsed_ms',
+        'ai_assisted',
+        'ai_attempts',
+        'ai_decision',
         'screenshot',
         'screenshot_url'
       ];
@@ -5685,6 +6692,11 @@ HTML = r"""
           step.target || '',
           step.expected || '',
           item.elapsed_ms || 0,
+          item.extra && item.extra.ai_assisted ? 'true' : 'false',
+          item.extra && Array.isArray(item.extra.ai_trace) ? item.extra.ai_trace.length : 0,
+          item.extra && Array.isArray(item.extra.ai_trace) && item.extra.ai_trace.length
+            ? item.extra.ai_trace[item.extra.ai_trace.length - 1].reason || ''
+            : '',
           item.extra && item.extra.screenshot ? item.extra.screenshot : '',
           item.extra && item.extra.screenshot_url ? item.extra.screenshot_url : ''
         ]);
@@ -5890,6 +6902,51 @@ def result_screenshot(filename):
         return jsonify({"error": "Screenshot not found."}), 404
 
     return send_from_directory(qa_results_dir(), safe_name, mimetype="image/png")
+
+
+@app.route("/api/redmine/status")
+def redmine_status():
+    return jsonify(redmine_status_payload())
+
+
+@app.route("/api/redmine/failures")
+def redmine_failures():
+    return jsonify({"failures": list_redmine_failures(), "redmine": redmine_status_payload()})
+
+
+@app.route("/api/redmine/failures/<failure_id>", methods=["PATCH"])
+def redmine_failure_update(failure_id):
+    try:
+        record = update_redmine_failure(safe_redmine_failure_id(failure_id), request.get_json(silent=True) or {})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify({"failure": record})
+
+
+@app.route("/api/redmine/failures/<failure_id>/link", methods=["POST"])
+def redmine_failure_link(failure_id):
+    try:
+        record = link_redmine_issue(safe_redmine_failure_id(failure_id), request.get_json(silent=True) or {})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify({"failure": record})
+
+
+@app.route("/api/redmine/failures/<failure_id>/create", methods=["POST"])
+def redmine_failure_create(failure_id):
+    try:
+        record = create_redmine_issue(safe_redmine_failure_id(failure_id), request.get_json(silent=True) or {})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify({"failure": record})
 
 
 @app.route("/api/testcase", methods=["GET", "POST"])
