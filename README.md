@@ -40,19 +40,49 @@ PC 브라우저에 실시간으로 표시합니다. Appium 자동화도 함께 �
 
 ### AI Random Run
 
-`Random Test > AI Random Run`은 OpenAI API를 사용해 UIAutomator, OCR, Memory,
-업로드된 Test Case와 이전 AI 실행 결과를 바탕으로 실행 순서를 계획합니다.
-API 키는 소스 파일에 저장하지 않고 서버 프로세스의 환경변수로 설정합니다.
+`Random Test > AI Random Run`은 기본적으로 **Codex CLI의 ChatGPT 로그인**을 사용합니다.
+UIAutomator, OCR, Memory, 업로드된 Test Case와 이전 AI 실행 결과로 실행 순서를
+한 번 계획하고, 실제 입력은 기존 ADB 실행기로 수행합니다. 매 클릭마다 AI가 화면을
+다시 판단하는 방식은 아닙니다. `Live Run`은 AI 호출 없이 기존 방식으로 동작합니다.
+
+서버를 실행하는 Windows 사용자 계정에서 먼저 로그인합니다.
 
 ```powershell
+codex login
+codex login status
+python mirror_server.py
+```
+
+- `Logged in using ChatGPT` 상태여야 합니다. API 키 로그인은 이 경로에서 사용하지 않습니다.
+- CLI 실행 파일은 PATH 또는 Codex 앱 설치 폴더에서 찾습니다. 필요한 경우
+  `CODEX_CLI_PATH`에 네이티브 `codex.exe`의 전체 경로를 지정합니다.
+- 모델은 CLI 기본값을 사용하며 `CODEX_MODEL`로 선택할 수 있습니다.
+- 임시 폴더에서 읽기 전용, 도구 비활성 상태로 후보 ID만 반환하게 합니다.
+  앱 파일 수정이나 AI가 만든 임의 좌표 실행은 허용하지 않습니다.
+- 계획 생성 제한 시간은 120초이며 Stop은 CLI 계획 생성도 중단합니다.
+- 로그인/한도/네트워크 오류는 일반 Live Run으로 전환하고 사유를 표시합니다.
+  유료 API로 자동 전환하지 않습니다.
+- 패널의 마지막 AI 실행 결과에 계획 적용 여부, 호출 시도 수, CLI가 보고한 입출력
+  토큰 수를 표시합니다. 이 토큰 수는 Pro 잔여 사용량의 퍼센트가 아닙니다.
+- 실행 이력은 `qa_results/ai_random_history.jsonl`에 저장됩니다.
+  후보 문구, Excel 요약, 이전 결과가 AI에 전송되므로 민감 데이터는 제외하세요.
+- 서버 접근자는 로그인된 계정의 사용량을 소비할 수 있습니다. 신뢰하는 내부 사용자만
+  접근하도록 운영하고 공용 인터넷에 그대로 노출하지 마세요.
+- AI Random Run API는 기본적으로 localhost에서만 허용합니다. 팀원의 다른 PC에서도
+  사용하려면 서버를 시작하기 전에 `RANDOM_AI_ALLOW_REMOTE=1`을 설정하세요. 네트워크의
+  다른 사용자가 로그인된 Codex 계정의 사용량을 쓸 수 있으므로 신뢰하는 사내망에서만 켜세요.
+
+기존 OpenAI API 방식이 필요한 경우에만 명시적으로 선택합니다. API 요금은 별도입니다.
+
+```powershell
+$env:RANDOM_AI_PROVIDER="openai_api"
 $env:OPENAI_API_KEY="YOUR_API_KEY"
 $env:OPENAI_MODEL="gpt-5.6-luna"  # optional
 python mirror_server.py
 ```
 
-키가 없거나 API 호출이 실패하면 동일한 후보를 사용하는 기존 Live Run 방식으로
-자동 전환되며, Random 패널과 상단 상태에 `AI: Fallback`이 표시됩니다.
-AI 실행 이력은 `qa_results/ai_random_history.jsonl`에 저장되어 다음 계획에 반영됩니다.
+기본 경로로 돌아가려면 `RANDOM_AI_PROVIDER=codex_cli`로 설정하고 서버를 재시작합니다.
+CLI 자동화 방식은 [공식 비대화형 실행 문서](https://learn.chatgpt.com/docs/non-interactive-mode)를 참고하세요.
 
 ### AI TC RUN
 
@@ -70,7 +100,8 @@ UI 후보를 OpenAI API로 분석해 안전한 후보를 선택합니다.
 - API 키가 없거나 호출이 실패하면 기존 Test Case 실행으로 자동 전환
 - 실행 이력은 `qa_results/ai_testcase_history.jsonl`에 저장
 
-AI TC RUN은 위의 `OPENAI_API_KEY`와 `OPENAI_MODEL` 설정을 AI Random Run과 공유합니다.
+AI TC RUN은 기존 `OPENAI_API_KEY`와 `OPENAI_MODEL` 설정을 사용합니다.
+이번 Codex CLI 연동은 AI Random Run에만 적용되며 AI TC RUN은 API 키가 필요합니다.
 
 ### Redmine 실패 이슈 검토
 
@@ -81,19 +112,31 @@ Test Case 실행 중 `Fail`이 발생하면 스크린샷, 기대결과, 실제 �
 
 Redmine 이슈 생성 기능은 서버를 실행하는 PowerShell에서 다음 환경변수를 설정한 뒤
 서버를 다시 시작해야 합니다. API 키는 브라우저나 결과 파일에 표시되지 않습니다.
+`REDMINE_PROJECT_ID`는 기본 프로젝트를 미리 선택하는 선택값이며, 비워 두면
+`Fail Review > Test connection` 후 검토 화면에서 프로젝트를 선택할 수 있습니다.
 
 ```powershell
 $env:REDMINE_URL="https://redmine.example.com"
 $env:REDMINE_API_KEY="YOUR_REDMINE_API_KEY"
-$env:REDMINE_PROJECT_ID="project-identifier"
+$env:REDMINE_PROJECT_ID="project-identifier" # optional default project
 $env:REDMINE_TRACKER_ID="1"          # optional
 $env:REDMINE_DEFAULT_PRIORITY_ID="2" # optional
 $env:REDMINE_ASSIGNEE_ID="12"        # optional
 python mirror_server.py
 ```
 
-실패 항목에 이슈를 연결한 뒤 같은 Excel을 다시 실행하면, 해당 Test Case의 최신
-Pass/Fail 결과가 연결된 검토 항목의 re-test 기록에 자동으로 추가됩니다.
+`Test connection`은 현재 API 키의 인증, 프로젝트 접근 권한과 접근 가능한 프로젝트
+목록을 확인합니다. 검토 화면에서는 프로젝트, 유형, 우선순위, 담당자를 Redmine
+선택 목록으로 고른 뒤 발행합니다.
+
+동일 Excel/Test Case/동작·대상 조합에 열린 Redmine 이슈가 있으면 `Create issue`는
+새 이슈 대신 최신 실패 증거와 캡처를 해당 이슈에 코멘트로 추가합니다. 연결된 항목을
+다시 실행해 Pass가 되면 `QA re-test PASSED` 코멘트를 비동기로 추가합니다. 이슈 상태는
+자동으로 변경하거나 종료하지 않습니다.
+
+네트워크 오류로 이슈 생성 결과를 확정할 수 없으면 자동 재시도를 막습니다. Redmine에서
+생성 여부를 확인한 뒤 검토 화면의 `Link existing`으로 연결해야 중복 이슈를 방지할 수
+있습니다.
 
 ### 미러링 FPS / 화질 — `mirror_server.py` 상단
 

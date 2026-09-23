@@ -38,9 +38,12 @@ echo        Done.
 echo.
 
 if not defined OPENAI_API_KEY (
-    echo [INFO] OPENAI_API_KEY is not set. AI Random Run will use Live Run fallback.
+    echo [INFO] OPENAI_API_KEY is not set. AI TC RUN will use standard fallback.
     echo.
 )
+echo [INFO] AI Random Run defaults to Codex CLI. Use codex login with ChatGPT.
+echo [INFO] RANDOM_AI_PROVIDER=openai_api selects the separate paid API instead.
+echo.
 
 :: Show connected devices
 echo [2/3] Checking ADB devices...
