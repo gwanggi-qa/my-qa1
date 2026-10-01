@@ -38,6 +38,7 @@ class RandomCodexTests(unittest.TestCase):
 
     def test_random_status_does_not_change_testcase_api_status(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
+                patch.object(m, "AI_PROVIDER", "openai_api"), \
                 patch.object(m, "RANDOM_AI_PROVIDER", "codex_cli"), \
                 patch.object(m, "codex_chatgpt_status", return_value={"configured": True, "state": "ready"}):
             data = m.app.test_client().get("/api/ai/status").get_json()
