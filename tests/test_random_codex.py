@@ -46,12 +46,12 @@ class RandomCodexTests(unittest.TestCase):
         self.assertTrue(data["random"]["configured"])
         self.assertEqual(data["random"]["provider"], "codex_cli")
 
-    def test_codex_remote_access_is_local_by_default_and_can_be_enabled(self):
-        with patch.dict(os.environ, {"RANDOM_AI_ALLOW_REMOTE": ""}):
-            self.assertFalse(m.random_ai_remote_access_allowed("192.168.1.20"))
-            self.assertTrue(m.random_ai_remote_access_allowed("127.0.0.1"))
-        with patch.dict(os.environ, {"RANDOM_AI_ALLOW_REMOTE": "1"}):
-            self.assertTrue(m.random_ai_remote_access_allowed("192.168.1.20"))
+    def test_codex_remote_access_uses_allowlist_even_with_legacy_flags(self):
+        for flag in ("", "1"):
+            with patch.dict(os.environ, {"RANDOM_AI_ALLOW_REMOTE": flag, "AI_ALLOW_REMOTE": flag}):
+                self.assertFalse(m.random_ai_remote_access_allowed("192.168.1.20"))
+                self.assertTrue(m.random_ai_remote_access_allowed("192.168.11.20"))
+                self.assertTrue(m.random_ai_remote_access_allowed("127.0.0.1"))
 
     def test_remote_ai_run_is_rejected_before_device_work(self):
         with patch.dict(os.environ, {"RANDOM_AI_ALLOW_REMOTE": ""}), \
