@@ -39,6 +39,32 @@ def candidate(label="Learning"):
 
 
 class AiTcTests(unittest.TestCase):
+    def test_unlabeled_clickable_icon_has_real_bounds_and_stable_identity(self):
+        xml = '<hierarchy><node class="android.widget.Button" clickable="true" enabled="true" bounds="[936,129][1080,273]"/></hierarchy>'
+        with patch.object(m, 'dump_ui_xml', return_value=xml), patch.object(m, 'build_ocr_candidates', return_value=[]):
+            candidates, context = m.ai_test_screen_candidates()
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]['source'], 'ui-icon')
+            self.assertTrue(context[0]['visual_identification_required'])
+            self.assertEqual((candidates[0]['x'], candidates[0]['y']), (1008, 201))
+            self.assertEqual(ai_tc.current_candidate(m, candidates[0]), candidates[0])
+
+    def test_unlabeled_noninteractive_disabled_and_risky_controls_excluded(self):
+        xml = '<hierarchy>' + ''.join([
+            '<node bounds="[0,0][100,100]"/>',
+            '<node clickable="true" enabled="false" bounds="[0,0][100,100]"/>',
+            '<node clickable="true" resource-id="delete_account" bounds="[0,0][100,100]"/>',
+            '<node clickable="true" bounds="[0,0][0,0]"/>',
+            '<node clickable="true" package="com.android.systemui" bounds="[0,0][100,100]"/>'
+        ]) + '</hierarchy>'
+        with patch.object(m, 'dump_ui_xml', return_value=xml), patch.object(m, 'build_ocr_candidates', return_value=[]):
+            self.assertEqual(m.ai_test_screen_candidates()[0], [])
+
+    def test_reference_title_and_purpose_do_not_add_acceptance_checks(self):
+        tc = {**step(), 'source': 'narrative_qa', 'title': 'Unrelated document',
+              'test_purpose': 'Verify "Other" and unrelated account history'}
+        self.assertEqual(ai_tc.validate_hint(hint(), tc), hint())
+
     def setUp(self):
         m._test_stop_event.clear()
         m._test_ai_context.metrics = {"planner_calls": 0, "responses": 0, "usage": {}}
@@ -231,7 +257,15 @@ class AiTcTests(unittest.TestCase):
         with patch.object(m, "_test_running", True), patch.object(m.threading, "Thread") as thread:
             client = m.app.test_client()
             for url in ["/api/run", "/api/random/run", "/api/recordings/example/play"]:
-                self.assertEqual(client.post(url, json={}).status_code, 409)
+                response = client.post(url, json={}, base_url="http://localhost:5000",
+                                       headers={"Origin": "http://localhost:5000",
+                                                "X-QA-CSRF-Token": m.local_access.token})
+                self.assertEqual(response.status_code, 409)
+                self.assertIn("Another automation", response.json["error"])
+                denied = client.post(url, json={}, base_url="http://localhost:5000",
+                                     headers={"Origin": "http://localhost:5000"})
+                self.assertEqual(denied.status_code, 403)
+                self.assertEqual(denied.json["code"], "page_verification_required")
         thread.assert_not_called()
 
     def run_suite(self, steps, ai=True, overview_error=None):

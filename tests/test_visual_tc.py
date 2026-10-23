@@ -36,6 +36,14 @@ def png():
 
 
 class VisualTests(unittest.TestCase):
+    def test_reference_metadata_does_not_require_data_or_visual_checks(self):
+        tc = step('설정으로 돌아온다.')
+        tc.update(title='다른 문서', test_purpose='점수 계산 정확성과 그래프 색상 확인')
+        self.assertEqual(ne.verification_gap(tc), '')
+        self.assertFalse(ne.needs_visual_verification(tc))
+        tc['expected'] = '점수 계산 결과가 원본 데이터와 일치한다.'
+        self.assertTrue(ne.verification_gap(tc))
+
     def setUp(self):
         m._test_stop_event.clear()
         self.addCleanup(m._test_stop_event.clear)
@@ -142,6 +150,28 @@ class VisualTests(unittest.TestCase):
                 with self.assertRaises(m.BlockedStep):
                     v.verify(m, step())
                 ask.assert_not_called()
+
+    def test_transient_screen_change_reobserves_without_input(self):
+        tc = step()
+        with ExitStack() as stack:
+            ask, _, adb = self.mocks(stack, response(tc))
+            stack.enter_context(patch.object(m, 'capture_screen_png',
+                side_effect=[self.solid_png(), png(), png(), png()]))
+            v.verify(m, tc)
+            self.assertEqual(tc['_visual_evidence']['observation_attempts'], 2)
+            ask.assert_called_once()
+            adb.assert_not_called()
+
+    def test_persistent_screen_change_blocks_after_two_observations(self):
+        with ExitStack() as stack:
+            ask, _, adb = self.mocks(stack)
+            capture = stack.enter_context(patch.object(m, 'capture_screen_png',
+                side_effect=[self.solid_png(), png()] * 2))
+            with self.assertRaises(m.BlockedStep):
+                v.verify(m, step())
+            self.assertEqual(capture.call_count, 4)
+            ask.assert_not_called()
+            adb.assert_not_called()
 
     def solid_png(self):
         stream = io.BytesIO()

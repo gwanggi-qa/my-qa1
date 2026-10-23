@@ -68,6 +68,15 @@ function setFilter(value){statuses.value=value;closeDetail(false);render();}
 function closeDetail(restore=true){const index=detailIndex;detailIndex=null;detailSignature='';detail.hidden=true;layout.classList.remove('has-detail');for(const b of body.querySelectorAll('.ex-case-link')){b.setAttribute('aria-expanded','false');b.closest('tr').classList.remove('ex-selected');if(restore&&Number(b.dataset.index)===index)b.focus({preventScroll:true});}}
 function field(parent,label,value){const line=$('div',undefined,'ex-field');line.append($('span',label,'ex-field-label'),$('span',text(value)));parent.append(line);}
 function rawDisclosure(parent,label,value){if(value===undefined||value===null)return;const box=$('details',undefined,'ex-raw');box.append($('summary',label),$('pre',text(value)));parent.append(box);}
+function redmineLinks(parent,reviews){
+ const linked=list(reviews).filter(r=>r.issue?.issue_id);if(!linked.length)return;
+ parent.append($('div','Redmine 등록 이슈','ex-mini-heading'));
+ const seen=new Set();for(const review of linked){const issue=review.issue,key=String(issue.issue_id);if(seen.has(key))continue;seen.add(key);
+  let url;try{const parsed=new URL(issue.issue_url);if(['http:','https:'].includes(parsed.protocol)&&!parsed.username&&!parsed.password)url=parsed.href;}catch{}
+  const entry=$(url?'a':'span','Redmine #'+key);if(url){entry.href=url;entry.target='_blank';entry.rel='noopener noreferrer';}parent.append(entry);
+  if(review.latest_retest)field(parent,'최근 재시험',text(review.latest_retest.status)+' · '+formatTime(review.latest_retest.at));
+ }
+}
 function evidenceUrl(e){if(typeof e.url!=='string')return null;const match=/^\/api\/results\/screenshot\/([A-Za-z0-9_.-]+\.png)$/.exec(e.url);return match&&!match[1].startsWith('.')?e.url:null;}
 function addEvidence(parent,entries){const grid=$('div',undefined,'ex-evidence-list'),seen=new Set();for(const raw of list(entries)){const e=record(raw),url=evidenceUrl(e);if(!url||seen.has(url))continue;seen.add(url);const a=$('a',undefined,'ex-evidence');a.href=url;a.target='_blank';a.rel='noopener noreferrer';const img=$('img');img.src=url;img.loading='lazy';img.alt='저장된 관찰 근거 '+text(e.file);img.onerror=()=>{img.hidden=true;label.textContent='근거 파일을 불러올 수 없습니다. '+text(e.file);};const label=$('span',text(e.file));a.append(img,label);if(e.captured_at)a.append($('span',formatTime(e.captured_at)));grid.append(a);}if(!grid.children.length)parent.append($('p','저장된 이미지 근거가 없습니다.','ex-note'));else parent.append(grid);}
 function conditions(parent,label,items,verified){if(!list(items).length)return;const group=$('div',undefined,'ex-conditions');group.append($('strong',label+(verified===true?' · 검증 완료':verified===false?' · 미확인':'')));for(const item of items){const c=record(item);group.append($('p',text(c.source||item)+(typeof c.present==='boolean'?' · '+(c.present?'표시 기대':'부재 기대'):'')));}parent.append(group);}
@@ -75,6 +84,8 @@ function showDetail(run,r,index,focus=true){detailIndex=index;detailSignature=JS
  const inner=$('div',undefined,'ex-detail-body'),badges=$('div',undefined,'ex-detail-status');badges.append(badge(r.status),$('span',method(run.method),'ex-source'));inner.append(badges);
  const observed=$('div',undefined,'ex-observation ex-'+stateClass(r.status));observed.append($('strong',r.status==='failed'?'기대와 다른 점':r.status==='blocked'?'검증하지 못한 이유':'실제 관찰 · 미수행 사유'),document.createTextNode(text(r.actual||r.reason)));inner.append(observed);
  if(r.reason&&r.actual)field(inner,'사유',r.reason);if(r.error_kind)field(inner,'원인 종류',causeNames[r.error_kind]||r.error_kind);
+ if(r.review_error)field(inner,'검토 기록 오류',r.review_error);
+ redmineLinks(inner,r.redmine_reviews);
  inner.append($('div','원문 절차 · 예상 / 실제','ex-mini-heading'));field(inner,'사전조건',r.source?.precondition);field(inner,'절차',r.source?.procedure);field(inner,'기대결과',r.source?.expected);
  inner.append($('div','단계별 검증 기록','ex-mini-heading'));const stages=list(r.stages);
  if(!stages.length)inner.append($('p','저장된 단계별 기록이 없습니다. 절차나 검증 결과를 추정하지 않습니다.','ex-note'));
@@ -106,7 +117,7 @@ refresh.onclick=load;runs.onchange=()=>{selected=runs.value;closeDetail(false);r
 stop.onclick=async()=>{stop.disabled=true;try{const r=await fetch('/api/run/stop',{method:'POST'});if(!r.ok)throw new Error('중단 요청 실패');await load();}catch(e){showError(e.message);}};
 mapOpen.onclick=()=>{mapping.hidden=!mapping.hidden;mapOpen.setAttribute('aria-expanded',String(!mapping.hidden));};
 sources.onclick=async()=>{try{const r=await fetch('/api/execution/sources');if(!r.ok)throw new Error('원문 조회 실패');sourceText.textContent=JSON.stringify(await r.json(),null,2);}catch(e){showError(e.message);}};
-execute.onclick=async()=>{if(!confirm.checked){showError('원문과 실기기 매핑 검토 확인이 필요합니다.');return;}execute.disabled=true;try{const payload=JSON.parse(mapText.value);const r=await fetch('/api/execution/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const v=await r.json();if(!r.ok)throw new Error(v.error||'실행 거부');selected=v.run_id;closeDetail(false);await load();}catch(e){showError(e.message);}finally{execute.disabled=false;}};
+execute.onclick=async()=>{if(!confirm.checked){showError('원문과 실기기 매핑 검토 확인이 필요합니다.');return;}execute.disabled=true;try{const payload=JSON.parse(mapText.value);const r=await window.startTestWithReview('/api/execution/run',payload);const v=await r.json();if(!r.ok)throw new Error(v.error||'실행 거부');selected=v.run_id;closeDetail(false);await load();}catch(e){showError(e.message);}finally{execute.disabled=false;}};
 render();activateView(false);
 const runtimeStatus=document.getElementById('view-runtime-status'),stopControls=document.getElementById('view-stop-controls');
 let runtime=null;

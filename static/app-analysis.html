@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="qa-csrf-token" content="__PAGE_TOKEN__">
+  <title>APK 분석 | Tablet QA</title>
+  <link rel="stylesheet" href="/static/app-analysis.css">
+  <script src="/static/local-request.js"></script>
+  <script src="/static/app-analysis.js" defer></script>
+  <script src="/static/tc-drafts.js" defer></script>
+</head>
+<body>
+  <header>
+    <a href="/" class="brand">Tablet QA</a>
+    <nav aria-label="솔루션 화면"><a href="/">테스트 실행</a><a href="/app-analysis" aria-current="page">APK 분석</a></nav>
+    <span class="scope">정적 분석 · Android MVP</span>
+  </header>
+  <main>
+    <div class="heading"><h1>앱 빌드 분석</h1><button id="refresh" type="button">새로고침</button></div>
+    <section class="environment" aria-label="분석 환경" id="environment">도구 확인 중</section>
+    <div id="message" role="status" aria-live="polite"></div>
+    <div class="layout">
+      <aside aria-label="등록된 빌드">
+        <h2>APK 등록</h2>
+        <form id="upload-form">
+          <label for="apk-file">단일 APK 파일 · 최대 200 MB</label>
+          <input type="file" id="apk-file" accept=".apk" required>
+          <button type="submit" id="upload">빌드 등록</button>
+        </form>
+        <div class="list-heading"><h2>등록된 빌드</h2><span id="build-count">0</span></div>
+        <div id="build-list" aria-label="빌드 선택"></div>
+      </aside>
+      <section class="detail" aria-label="분석 상세">
+        <div class="detail-heading"><h2 id="build-name">선택된 빌드 없음</h2><span id="job-status" class="badge">대기</span></div>
+        <dl id="build-meta"></dl>
+        <div class="actions"><button id="analyze" type="button" disabled>정적 분석 시작</button><button id="stop" type="button" disabled>분석 중단</button></div>
+        <p class="notice">정적 APK 분석: 기기 설치·실행·AI 호출 없음 · 분석 완료 ≠ 테스트 Pass</p>
+        <section class="references" aria-labelledby="reference-title">
+          <div class="result-heading"><h3 id="reference-title">참고자료</h3><span id="reference-count">0개</span></div>
+          <p id="reference-build" class="reference-status">APK를 선택하세요</p>
+          <form id="reference-form">
+            <label>자료 유형<select id="reference-kind"><option value="requirements">기획서</option><option value="design">디자인</option><option value="testcase">기존 TC</option></select></label>
+            <label>파일 · 최대 20 MB<input type="file" id="reference-file" accept=".xlsx,.pdf,.md,.txt,.png,.jpg,.jpeg" required></label>
+            <label class="source-field">원본 Notion / Figma 주소 (선택)<input id="reference-source" type="url" maxlength="2048" placeholder="https://" autocomplete="off"></label>
+            <button id="reference-upload" type="submit" disabled>참고자료 등록</button>
+          </form>
+          <form id="figma-form" class="integration-form">
+            <label>Figma 프레임 링크<input id="figma-url" type="url" maxlength="2048" placeholder="https://www.figma.com/design/…?node-id=…" required></label>
+            <button id="figma-import" type="submit" disabled>Figma에서 가져오기</button>
+          </form>
+          <p id="figma-status" class="reference-status" role="status">Figma 연결 확인 중</p>
+          <p class="reference-status" id="reference-message" role="status" aria-live="polite">자료 등록: AI 미사용</p>
+          <div class="reference-layout">
+            <div id="reference-list" aria-label="참고자료 목록"></div>
+            <section class="reference-preview" aria-label="참고자료 미리보기">
+              <div class="detail-heading"><h3 id="reference-name">선택된 자료 없음</h3><button id="reference-delete" type="button" disabled>삭제</button></div>
+              <dl id="reference-meta"></dl>
+              <label id="reference-unit-label" hidden>시트 / 페이지<select id="reference-unit"></select></label>
+              <p id="reference-warning" class="notice"></p>
+              <div id="reference-content" tabindex="0"></div>
+            </section>
+          </div>
+        </section>
+        <section class="drafts" aria-labelledby="draft-title">
+          <div class="result-heading"><h3 id="draft-title">AI TC 초안</h3><span id="draft-provider" class="reference-status">AI 연결 확인 중</span></div>
+          <div class="actions"><span class="reference-status">표준 양식: TestCase · 1~3Depth · 수동/자동화 결과 분리</span><button id="draft-template" type="button">표준 TC 양식 다운로드</button></div>
+          <div id="draft-sources" aria-label="생성에 사용할 자료"></div>
+          <form id="draft-form">
+            <label>생성 범위<input id="draft-scope" maxlength="500" placeholder="예: 학습 관리 화면의 LC·RC 표시와 탭 전환" required></label>
+            <label>최대 TC 수<input id="draft-count" type="number" min="1" max="20" value="10" required></label>
+            <label class="check"><input id="draft-images" type="checkbox">선택 자료의 이미지 포함 (최대 4개)</label>
+            <button id="draft-preview" type="submit" disabled>AI 입력 미리보기</button>
+          </form>
+          <details id="draft-input" hidden><summary>AI 전송 내용</summary><div id="draft-input-images"></div><pre id="draft-context"></pre></details>
+          <label class="check"><input id="draft-consent" type="checkbox" disabled>선택 자료·이미지의 민감정보를 확인했으며, 표시된 AI provider로 전송하고 사용량이 발생하는 것에 동의합니다.</label>
+          <div class="actions"><button id="draft-generate" type="button" disabled>AI TC 초안 생성</button><button id="draft-stop" type="button" disabled>생성 중단</button></div>
+          <p id="draft-message" class="reference-status" role="status" aria-live="polite">미실행 · 초안 검토 대기</p>
+          <p id="draft-clock" class="reference-status" aria-live="off" hidden></p>
+          <label>생성 이력<select id="draft-history"><option value="">생성 이력 없음</option></select></label>
+          <div id="draft-review" hidden>
+            <p id="draft-summary"></p><p id="draft-questions" class="notice"></p>
+            <div class="actions"><button id="draft-export" type="button" disabled>승인 TC Excel 내보내기</button></div>
+            <label>검토할 TC<select id="draft-case"></select></label>
+            <form id="draft-case-form">
+              <label>제목<input id="case-title" maxlength="2000" required></label>
+              <label>테스트 목적<textarea id="case-objective" maxlength="2000" required></textarea></label>
+              <label>사전조건<textarea id="case-preconditions" maxlength="2000" required></textarea></label>
+              <label>테스트 절차 (줄마다 1단계)<textarea id="case-steps" required></textarea></label>
+              <label>기대결과 (줄마다 1조건)<textarea id="case-expected_results" required></textarea></label>
+              <label>미확인 조건·가정<textarea id="case-assumptions"></textarea></label>
+              <label>우선순위<select id="case-priority"><option>P1</option><option>P2</option><option>P3</option></select></label>
+              <label>Type<input id="case-test_type" maxlength="100" list="tc-types"><datalist id="tc-types"><option value="기능"><option value="UI-UX"><option value="데이터정합성"><option value="성능"><option value="호환성"><option value="접근성"><option value="보안"></datalist></label>
+              <label>1Depth<input id="case-depth1" maxlength="100"></label>
+              <label>2Depth<input id="case-depth2" maxlength="100"></label>
+              <label>3Depth<input id="case-depth3" maxlength="100"></label>
+              <label>시나리오 분류<select id="case-category"><option value="normal">정상</option><option value="exception">예외</option><option value="boundary">경계값</option><option value="permission">권한</option><option value="network">네트워크</option></select></label>
+              <label>출처 ID (쉼표 구분)<input id="case-source_ids" required></label>
+              <pre id="case-evidence"></pre>
+              <label>검토 상태<select id="case-review-status"><option value="draft">검토 대기</option><option value="approved">검토 승인 (미실행)</option><option value="rejected">제외</option></select></label>
+              <button id="case-save" type="submit">검토 저장</button>
+            </form>
+            <details><summary>AI 원본 초안</summary><pre id="draft-original"></pre></details>
+          </div>
+        </section>
+        <div id="analysis-result" hidden>
+          <div id="metrics" class="metrics"></div>
+          <dl id="package-meta"></dl>
+          <div class="result-heading"><h3>선언 정보</h3><label class="search"><span class="sr-only">권한·컴포넌트 검색</span><input id="search" type="search" placeholder="이름 검색"></label></div>
+          <div class="result-tabs" role="tablist" aria-label="분석 결과">
+            <button type="button" id="components-tab" role="tab" aria-selected="true" aria-controls="inventory">컴포넌트</button>
+            <button type="button" id="permissions-tab" role="tab" aria-selected="false" aria-controls="inventory">권한</button>
+          </div>
+          <div class="table-wrap" id="inventory" role="tabpanel" aria-labelledby="components-tab"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+        </div>
+        <section class="limits"><h3>미검증 사항</h3><ul><li>화면 동작·기능 정확성·비즈니스 요구사항</li><li>APK 서명·배포자 신뢰성</li><li>네이티브 코드·서버 응답·동적 로딩</li></ul></section>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

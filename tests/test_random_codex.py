@@ -77,6 +77,7 @@ class RandomCodexTests(unittest.TestCase):
         process.poll.return_value = 0
 
         def launch(command, **kwargs):
+            self.assertIn("--no-daemon", command)
             self.assertIn("read-only", command)
             self.assertIn("--ignore-user-config", command)
             self.assertIn("shell_tool", command)

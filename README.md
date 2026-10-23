@@ -378,3 +378,80 @@ Windows 방화벽은 사설 프로필, 서버 Python 프로그램, TCP 5000, 로
 상태 변경 API는 같은 출처의 Origin, 검증 헤더, JSON 객체가 필요합니다. Excel 업로드는 기존 multipart 형식을 유지합니다. 화면의 fetch 공통 처리가 검증 헤더를 붙이고, 빈 POST/DELETE 요청을 JSON 객체로 만듭니다. 이미지와 다운로드에는 세션 동안만 유지되는 HttpOnly/SameSite=Strict 페이지 쿠키를 사용하며, 쿠키만으로 상태 변경은 허용하지 않습니다. 검증값 없이 API를 직접 호출하면 403입니다.
 
 격리 회귀 검증: `python -B tests/run_isolated.py`. 실제 기기/외부 접속을 차단하고 임시 저장소를 사용합니다. Socket.IO 화면은 Origin을 보내는 WebSocket 전송을 사용합니다. localhost 주소/포트 설정은 요청의 Host나 프록시 헤더에서 추론하지 않습니다.
+
+## APK 정적 분석 MVP
+
+상단의 APK 분석 링크 또는 /app-analysis에서 단일 APK(최대 200 MiB)를 등록합니다.
+정적 분석 시작을 누르면 REA/JADX가 패키지·버전·SDK·권한·컴포넌트 선언과
+클래스·리소스 수를 조회합니다. APK 설치, AI 호출, TC Pass 판정은 하지 않습니다.
+기존 TC 실행·Recorder·Random 기능은 변경하지 않습니다.
+
+도구 설치 명령은 python tools/setup_analysis.py이며 네트워크 다운로드가 필요합니다.
+이 PC에서는 Android Studio의 Java 21을 사용하고 전역 JAVA_HOME은 변경하지 않습니다.
+다른 PC에서는 QA_ANALYSIS_JAVA_HOME을 JDK 17 이상 경로로 지정하세요.
+
+APK와 SQLite DB는 Git 제외 경로인 qa_results/app_analysis에 저장되며 별도 백업이
+필요합니다. 기존 허용 사내망에서 조회할 수 있고 사용자별 인증은 아직 없습니다.
+읽기 전용 REA MCP 설정은 이 PC의 .codex/config.toml에만 있으며 다음 Codex 세션에서
+반영됩니다. 상세 범위는 [API 계약](docs/app-analysis-mvp.md), 검증 결과는
+[검증 기록](docs/app-analysis-validation.md)을 확인하세요.
+
+## APK 참고자료 등록
+
+`http://localhost:5000/app-analysis`에서 APK를 선택한 뒤 `참고자료`에
+기획서, 디자인, 기존 TC 파일을 등록할 수 있습니다. 지원 형식은 XLSX, PDF,
+UTF-8 Markdown/TXT, PNG/JPEG이며 파일당 20 MiB입니다. PDF 읽기에는 `pypdf`가
+필요하며 `setup_and_run.bat` 설치 목록에 포함됩니다.
+
+자료는 선택한 APK 해시에 연결해 로컬 SQLite에 보관합니다. Excel의 시트/셀,
+PDF 페이지, 텍스트 줄 번호와 제한된 미리보기를 제공하며 원본을 수정하지
+않습니다. 파일 등록의 Notion/Figma 주소는 출처 기록용입니다. 별도 Figma
+가져오기와 AI 초안 생성은 아래 절차로 사용합니다. 민감한 정보가 있는
+자료는 등록 전에 제거하세요. 접근 가능한 사내 사용자는 등록 자료도 볼 수
+있습니다. API와 제한 사항: [참고자료 계약](docs/reference-materials.md).
+
+## Figma 가져오기와 AI TC 초안
+
+- 서버 실행 환경에 `FIGMA_ACCESS_TOKEN`을 설정합니다. Figma 개인 액세스
+  토큰은 `file_content:read` 범위와 대상 파일 접근 권한이 필요합니다.
+  토큰은 브라우저·대화·Git에 저장하지 않습니다. 환경 변경 후 서버 재시작이
+  필요합니다. Codex의 Figma 플러그인 로그인과 서버 토큰은 별개입니다.
+- APK 선택 후 Figma 프레임 링크(node-id 포함)를 `Figma에서 가져오기`에
+  입력합니다. 선택한 화면의 노드·문구·위치와 가능한 경우 PNG를 버전별로
+  보관합니다. PNG 실패 시 노드 자료만 보존하고 부분 수집 상태를 표시합니다.
+- `AI TC 초안`에서 참고자료 1-8개와 범위, 최대 생성 수 1-20개를 선택합니다.
+  이미지 포함은 별도 선택입니다. `AI 입력 미리보기`에서 전송 텍스트와
+  이미지를 확인하고 동의한 뒤 생성합니다. 기본 provider는 기존 Codex CLI이며
+  유료 OpenAI API는 명시적으로 설정한 경우에만 사용합니다. 자동 전환은 없습니다.
+- 생성된 TC는 미실행 초안입니다. 출처·가정·기대결과를 검토하고 수정한 다음
+  검토 상태를 승인으로 바꾸고 저장합니다. 승인한 TC만 Excel로 내보냅니다.
+  TestCase 시트와 Sources 시트에 TC, 출처 위치, 파일 해시를 보존합니다.
+  기존 Excel의 서식을 복제하는 기능이나 자동 실행 승인 기능은 아닙니다.
+- Notion 직접 연결은 이번 범위가 아닙니다. 기존 PDF/Markdown 파일 등록을
+  사용합니다. 시각 자료나 일부만 읽힌 문서는 완전한 요구사항 검증 근거가
+  아니므로 담당자 검토가 필요합니다.
+
+구현·검증 범위: [TC 초안 연동](docs/tc-draft-generation.md).
+
+## 기대결과 기반 TC 실행
+
+Fail Review는 현재 TC 회차의 검수·발행 작업 공간입니다. 서버 재시작과 새 TC 실행
+시작 시 이전 검토 목록을 비우며, 미처리 항목이 있으면 실행 전에 확인합니다.
+등록한 Redmine 이슈와 캡처는 삭제하지 않고 실행 결과 대시보드에서 확인합니다.
+
+APK 분석에서 생성·검토·승인한 TC는 `testcase.xlsx` 기준 14열로 내보냅니다.
+`통합ID / 제목 / 우선순위 / 1Depth / 2Depth / 3Depth / Type / 테스트목적 /
+사전조건 / 테스트절차 / 기대결과 / 결과 / 자동화 결과 / 비고` 순서입니다.
+APK 분석 페이지의 `표준 TC 양식 다운로드`에서 빈 양식을 받을 수 있습니다.
+이전 초안의 비어 있는 뎁스·유형은 검토 화면에서 보완할 수 있습니다.
+
+`결과`는 기존 수동 기록으로 보존하고, 실행 판정은 `자동화 결과`에 기록합니다.
+실행결과 Excel 사본에는 선택 TC의 판정과 별도 `실행 상세` 시트의 절차·사유·캡처 경로가
+포함됩니다. 원본 Excel 파일과 기대결과는 덮어쓰지 않습니다.
+
+문장형 TC는 `검증결과` 열 없이 `기대결과`를 기준으로 실행할 수 있습니다.
+TC를 선택하고 Run Test Case 또는 AI TC RUN으로 계획을 준비한 뒤,
+버튼 아래 원문 절차와 Block 사유를 확인하고 `계획 확인 후 실행`을 누릅니다.
+AI 모드는 선택 자료·실행 화면 분석에 대한 동의가 필요합니다. 결과는 원본 기대결과와
+분리해 저장하며 `실행결과 Excel`로 내보냅니다. 범위와 제한은
+[TC 실행 흐름](docs/tc-execution-workflow.md)을 확인하세요.

@@ -21,6 +21,7 @@ STATUS_CODES = {"passed": "Pass", "failed": "F", "blocked": "NT",
                 "stopped": "NT", "not_run": "NT", "not_applicable": "NA"}
 ID_HEADERS = {"no", "번호", "tcid", "testcaseid", "tc번호", "통합id", "테스트id", "caseno"}
 RESULT_HEADERS = {"검증결과", "검증결과pfntna", "result", "결과"}
+AUTOMATION_RESULT_HEADERS = {"자동화결과", "automationresult", "automatedresult"}
 
 
 def normalized(value):
@@ -35,6 +36,9 @@ class RowTarget:
     case_no: str
     id_cell: str
     result_cell: str
+    automated: bool = False
+    note_cell: str = ''
+    original_note: str = ''
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,7 @@ class RunSnapshot:
     run_id: str
     template: Template
     statuses: tuple
+    notes: tuple = ()
 
 
 def _open_package(payload):
@@ -79,6 +84,14 @@ def _sheet_paths(package):
 
 
 def _headers(ws, selection=None):
+    # A dedicated automation result column always wins over the manual result.
+    for row in ws.iter_rows(max_row=min(ws.max_row, 50)):
+        ids=[c.column for c in row if normalized(c.value) in ID_HEADERS]
+        automated=[c.column for c in row if normalized(c.value) in AUTOMATION_RESULT_HEADERS]
+        if len(ids)==len(automated)==1:
+            return next(c.row for c in row if getattr(c,'row',None)), ids[0], automated[0]
+        if ids and len(automated)>1:
+            raise ValueError('자동화 결과 열이 중복되어 기록 대상을 결정할 수 없습니다.')
     if selection and selection.get("sheet") == ws.title:
         mapping = selection.get("mapping", {})
         if "case_no" in mapping and "qa_result" in mapping:
@@ -244,7 +257,13 @@ def prepare_template(payload, filename, steps, selection=None):
                     raise ValueError("병합된 검증결과 셀은 안전하게 기록할 수 없습니다.")
                 if cells[result_column-1].data_type == "f":
                     raise ValueError("검증결과 셀에 수식이 있어 결과 기록을 중단합니다.")
-                targets.append(RowTarget(index, sheet, row, case_no, id_cell, result_cell))
+                automated=normalized(ws.cell(header,result_column).value) in AUTOMATION_RESULT_HEADERS
+                note_column = next((c.column for c in ws[header] if normalized(c.value) in {'비고', 'note', 'notes'}), None)
+                note_cell = f"{get_column_letter(note_column)}{row}" if note_column else ''
+                original_note = str(ws.cell(row, note_column).value or '') if note_column else ''
+                if note_column and (ws.cell(row, note_column).data_type == 'f' or any(note_cell in CellRange(area) for area in merged[sheet])):
+                    note_cell = ''
+                targets.append(RowTarget(index, sheet, row, case_no, id_cell, result_cell, automated, note_cell, original_note))
             if not targets or len({(t.sheet, t.result_cell) for t in targets}) != len(targets):
                 raise ValueError("결과 대상 행이 없거나 중복되어 있습니다.")
             formulas, warnings = [], []
@@ -281,13 +300,15 @@ def finish_run(run_id, template, steps, results, stopped=False, active_indices=(
         raise ValueError("선택한 원본 TC 인덱스가 올바르지 않습니다.")
     statuses = ["preserved" if i not in selected else "stopped" if stopped and i in active_indices else "not_run" for i in range(1, len(steps)+1)]
     seen = set()
+    notes = [''] * len(steps)
     for result in results:
         index, status = result.get("index"), result.get("status")
         if type(index) is not int or index not in selected or index in seen or status not in STATUS_CODES:
             raise ValueError("중복되거나 유효하지 않은 실행 결과입니다.")
         seen.add(index)
         statuses[index-1] = status
-    return RunSnapshot(run_id, template, tuple(statuses))
+        notes[index-1] = str(result.get('note') or '')
+    return RunSnapshot(run_id, template, tuple(statuses), tuple(notes))
 
 
 CELL_RE = re.compile(r'<(?P<tag>(?:[\w]+:)?c)\b(?P<attrs>[^>]*?)(?:\s*/>|>(?P<body>.*?)</(?P=tag)\s*>)', re.S)
@@ -349,12 +370,20 @@ def export_run(snapshot, expected_hash):
     with _open_package(template.payload) as source:
         paths = _sheet_paths(source)
         edits = {}
-        for target, status in zip(template.rows, snapshot.statuses):
+        for index, (target, status) in enumerate(zip(template.rows, snapshot.statuses)):
             if status == "preserved":
                 continue
             path = paths[target.sheet]
             xml = edits.get(path, source.read(path).decode("utf-8"))
-            edits[path] = _write_value(xml, target.result_cell, STATUS_CODES[status])
+            if target.automated:
+                from tc_format import STATUS_CODES as automated_codes
+                value=automated_codes[status]
+            else:
+                value=STATUS_CODES[status]
+            edits[path] = _write_value(xml, target.result_cell, value)
+            if target.note_cell and snapshot.notes and snapshot.notes[index]:
+                note = '\n'.join(s for s in (target.original_note, snapshot.notes[index]) if s)
+                edits[path] = _write_value(edits[path], target.note_cell, note[:32767])
         for sheet, cell, formula in template.formulas:
             path = paths[sheet]
             xml = edits.get(path, source.read(path).decode("utf-8"))

@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 qa_results/
 recordings/
+# Local tool paths; never commit machine-specific Codex configuration.
+.codex/config.toml
 mirror_server.before_*.py
 *.bak
 *.backup

@@ -1,0 +1,112 @@
+// All browser requests are fulfilled locally with synthetic responses. No device/AI/server writes.
+const {chromium}=require('playwright');
+const fs=require('node:fs');
+const path=require('node:path');
+const assert=require('node:assert/strict');
+const root=path.resolve(__dirname,'..');
+const source=fs.readFileSync(path.join(root,'mirror_server.py'),'utf8');
+let html=source.split('HTML = r"""')[1].split('"""')[0];
+html=html.replace('<head>','<head><meta name="qa-csrf-token" content="fixture"><script src="/static/local-request.js"></script>');
+html=html.replace(/<script src="https:\/\/cdn\.socket\.io[^>]*><\/script>/,'<script>window._socketEvents={};window.io=()=>({on(e,fn){window._socketEvents[e]=fn;if(e==="connect")setTimeout(fn,0);},emit(){}});</script>');
+html=html.replace('</body>','<script src="/execution-dashboard.js" defer></script><script src="/static/tc-workflow.js" defer></script></body>');
+const metadata={upload_id:'synthetic-upload',file_hash:'synthetic-hash',source:'narrative_qa'};
+const step={source:'narrative_qa',case_no:'DTC-001',sheet:'TestCase',row:2,title:'합성 설정 확인',precondition:'홈 표시',test_item:'설정 버튼을 클릭한다.',expected:'설정 화면이 표시된다',action:'blocked',ai_pending:true};
+let flow=null,readyAt=0,finishedAt=0;
+const oldReview={id:'failure-aaaaaaaaaaaa',status:'pending_review',run:{id:'old-run'},test_case:{id:'OLD-001',description:'이전 회차 합성 실패'},redmine:{}};
+let reviews=[oldReview],acceptReset=false,resetPrompts=0;
+const view=()=>{if(flow?.state==='preparing'&&Date.now()>readyAt){flow.state='ready';flow.message='계획 준비 완료 · 실행 가능 1 / 1';}if(flow?.state==='running'&&Date.now()>finishedAt){flow.state='finished';flow.message='실행 종료 · Pass 1 / Fail 0 / Block 0';flow.results={counts:{passed:1,failed:0,blocked:0}};}return flow;};
+(async()=>{
+  const browser=await chromium.launch({channel:'msedge',headless:true});
+  const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[],calls=[];
+  page.on('pageerror',e=>errors.push(e.message));
+  page.on('dialog',async d=>{resetPrompts++;assert.match(d.message(),/초기화/);await(acceptReset?d.accept():d.dismiss());});
+  await page.route('**/*',async route=>{
+    const u=new URL(route.request().url());
+    assert.equal(u.hostname,'localhost');
+    if(u.pathname==='/')return route.fulfill({contentType:'text/html',body:html});
+    if(u.pathname==='/static/tc-workflow.js')return route.fulfill({contentType:'application/javascript',body:fs.readFileSync(path.join(root,'static/tc-workflow.js'),'utf8')});
+    if(u.pathname==='/static/local-request.js')return route.fulfill({contentType:'application/javascript',body:fs.readFileSync(path.join(root,'static/local-request.js'),'utf8')});
+    if(u.pathname==='/execution-dashboard.js')return route.fulfill({contentType:'application/javascript',body:fs.readFileSync(path.join(root,'static/execution-dashboard.js'),'utf8')});
+    if(u.pathname==='/static/execution-dashboard.css')return route.fulfill({contentType:'text/css',body:fs.readFileSync(path.join(root,'static/execution-dashboard.css'),'utf8')});
+    if(u.pathname==='/api/redmine/failures')return route.fulfill({json:{failures:reviews,redmine:{configured:false},review:{pending:reviews.length,token:'review-v1'}}});
+    if(u.pathname==='/api/execution/results')return route.fulfill({json:{current:null,history:[{run_id:'old-run',state:'finished',method:'automated_device',filename:'synthetic.xlsx',started_at:'2026-10-20T00:00:00Z',finished_at:'2026-10-20T00:01:00Z',results:[{index:1,status:'failed',source:{tc_id:'OLD-001',title:'이전 회차 합성 실패'},redmine_reviews:[{issue:{issue_id:'123',issue_url:'https://redmine.example/issues/123'}},{issue:{issue_id:'456',issue_url:'javascript:alert(1)'}}]}]}]}});
+    if(u.pathname==='/api/testcase')return route.fulfill({json:{metadata,source:'narrative_qa',steps:[step]}});
+    if(u.pathname==='/api/tc-workflow/prepare'){
+      calls.push(route.request().postDataJSON());
+      flow={id:'synthetic-plan',state:'preparing',message:'AI 절차 분석 중',ai_mode:true,plan_digest:'digest',file_hash:metadata.file_hash,upload_id:metadata.upload_id,cases:[{index:1,case_no:step.case_no,title:step.title,precondition:step.precondition,procedures:[step.test_item],expected:step.expected,plan:{actions:[{procedure:1,action:'tap',target:'설정',basis:'procedure',source:step.test_item}],checks:[{expectation:1,after_action:1}],blocked_reason:''}}]};readyAt=Date.now()+1000;
+      return route.fulfill({status:202,json:{workflow:flow}});
+    }
+    if(u.pathname==='/api/tc-workflow/current')return route.fulfill({json:{workflow:view()}});
+    if(u.pathname.endsWith('/start')){
+      const payload=route.request().postDataJSON();
+      if(reviews.length&&!payload.review_reset_confirmed)return route.fulfill({status:409,json:{code:'fail_review_reset_required',error:'초기화 확인 필요',review:{pending:reviews.length,token:'review-v1'}}});
+      assert.equal(payload.review_reset_token,'review-v1');reviews=[];
+      flow.state='running';flow.message='DTC-001 · 절차 1/1 · tap 설정';finishedAt=Date.now()+1200;
+      await route.fulfill({status:202,json:{workflow:flow}});
+      await page.evaluate(()=>window._socketEvents.fail_review_changed({}));return;
+    }
+    return route.fulfill({json:{recordings:[],failures:[],configured:false,steps:[],history:[],current:null}});
+  });
+  try{
+    await page.goto('http://localhost:5017/',{waitUntil:'networkidle'});
+    await page.waitForFunction(()=>document.querySelectorAll('.tc-flow-selection').length===1);
+    await page.locator('#btn-ai-test').click();
+    await page.waitForFunction(()=>document.querySelector('#tc-flow-message').textContent.includes('동의'));
+    assert.equal(calls.length,0);
+    await page.locator('#tc-flow-consent').check();
+    await page.locator('#btn-ai-test').click();
+    await page.waitForFunction(()=>!document.querySelector('#tc-flow-start').disabled);
+    assert.equal(calls.length,1);
+    assert.deepEqual(calls[0].indices,[1]);
+    assert.equal(calls[0].ai_mode,true);
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/최대 5회/);
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/동작 1 직후 기대결과 1 검증/);
+    await page.locator('#tc-flow-plan').scrollIntoViewIfNeeded();
+    await page.screenshot({path:path.join(root,'qa_results/tc-flow-desktop.png')});
+    await page.reload({waitUntil:'networkidle'});
+    await page.waitForFunction(()=>!document.querySelector('#tc-flow-start').disabled);
+    await page.locator('#tc-flow-start').click();
+    await page.waitForFunction(()=>document.querySelector('#tc-flow-message').textContent.includes('취소'));
+    assert.equal(await page.locator('#redmine-failure-count').innerText(),'1');
+    assert.equal(flow.state,'ready');acceptReset=true;
+    await page.locator('#tc-flow-start').click();
+    await page.waitForFunction(()=>document.querySelector('#tc-flow-message').textContent.includes('실행 종료'));
+    assert.equal(resetPrompts,2);
+    await page.waitForFunction(()=>document.querySelector('#redmine-failure-count').textContent==='0');
+    reviews=[{...oldReview,id:'failure-bbbbbbbbbbbb',run:{id:'synthetic-plan'},test_case:{id:'DTC-001',description:'현재 회차 합성 실패'}}];
+    await page.evaluate(()=>window._socketEvents.fail_review_changed({}));
+    await page.waitForFunction(()=>document.querySelector('#redmine-failure-count').textContent==='1');
+    assert.equal(await page.locator('#tc-flow-export').isDisabled(),false);
+    assert.equal(await page.locator('#btn-workbook-export').isDisabled(),false);
+    assert.ok((await page.locator('#workbook-export-note').textContent()).includes('별도 열'));
+    await page.setViewportSize({width:390,height:844});
+    await page.locator('#tc-flow-message').scrollIntoViewIfNeeded();
+    assert.ok(await page.locator('#tc-flow-message').evaluate(e=>{
+      const r=e.getBoundingClientRect(), w=e.closest('.workspace').getBoundingClientRect();
+      const hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
+      return r.top>=w.top&&r.bottom<=w.bottom&&(hit===e||e.contains(hit));
+    }), 'Flow must remain inside the scrollable work area, not behind the mirror.');
+    assert.equal(await page.locator('#tc-flow-consent').evaluate(e=>e.getBoundingClientRect().width),16);
+    await page.screenshot({path:path.join(root,'qa_results/tc-flow-mobile.png')});
+    assert.ok(await page.locator('#tc-flow').evaluate(e=>e.scrollWidth<=e.clientWidth+1));
+    await page.locator('#execution-open').click();
+    await page.locator('.ex-case-link').first().click();
+    assert.equal(await page.locator('#execution-detail a[href="https://redmine.example/issues/123"]').count(),1);
+    assert.equal(await page.locator('#execution-detail a[href^="javascript:"]').count(),0);
+    await page.screenshot({path:path.join(root,'qa_results/fail-review-result-links.png')});
+    assert.deepEqual(errors,[]);
+    flow.state='ready';flow.executable_count=0;flow.results=null;
+    flow.message='실행 가능 0 · 기기 미실행';
+    flow.cases[0].plan.blocked_reason='계획 확인 필요';
+    flow.cases[0].planning={status:'blocked',retry_count:1,errors:[{tc_id:'DTC-001',code:'plan_schema',field:'plan.actions[0].source',message:'원문 근거 불일치',hint:'해당 TC를 다시 준비하세요.'}]};
+    await page.reload({waitUntil:'networkidle'});
+    await page.waitForFunction(()=>document.querySelector('#tc-flow-message').textContent.includes('실행 가능 0'));
+    assert.equal(await page.locator('#tc-flow-start').isDisabled(),true);
+    await page.locator('#tc-flow-plan > summary').click();
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/plan.actions\[0\].source/);
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/재계획 1\/1/);
+    await page.screenshot({path:path.join(root,'qa_results/tc-plan-errors-mobile.png')});
+    assert.deepEqual(errors,[]);
+    console.log(JSON.stringify({selection:true,consent:true,plan:true,reload:true,executionFlow:true,resetCancel:true,resetConfirm:true,newFailure:true,historyLinks:true,mobile:true,zeroExecutableDisabled:true,planningErrors:true,errors}));
+  }finally{await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});

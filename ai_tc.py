@@ -116,11 +116,7 @@ def validate_hint(hint, step):
         reference_only = bool(re.fullmatch(r"\d+종\s*모두\s*존재(?:\([^)]*\))?[.!]?", expected.strip()))
         if not clauses or (not (expanded_reference and reference_only) and any(c not in coverage for c in clauses)):
             raise ValueError("AI checks do not cover the original expected result")
-        if purpose and not expanded_reference:
-            purpose_clauses = [compact(s) for s in re.split(r"[\n;]+|\s+및\s+|\s+그리고\s+|\s+and\s+", purpose) if s.strip()]
-            if any(c not in coverage for c in purpose_clauses):
-                raise ValueError("AI checks do not cover the original test purpose")
-        labels = re.findall(r'["\u201c]([^"\u201d]+)["\u201d]', expected + "\n" + purpose)
+        labels = re.findall(r'["\u201c]([^"\u201d]+)["\u201d]', expected)
         for label in labels:
             if not any(compact(label) in compact(c["text"]) for c in hint["checks"]):
                 raise ValueError("AI omitted an explicitly quoted expected label")

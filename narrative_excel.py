@@ -15,6 +15,7 @@ FIELDS = {
     "automation_possible": ("자동화가능", "automatable"),
     "enabled": ("enabled", "use", "사용", "실행"),
     "qa_result": ("결과", "검증결과", "result"),
+    "automation_result": ("자동화 결과", "automation result", "automated result"),
     **{f"depth{i}": (f"{i}Depth",) for i in range(1, 8)},
 }
 LABELS = {key: aliases[0] for key, aliases in FIELDS.items()}
@@ -99,10 +100,7 @@ def verification_gap(step):
     source = text(step.get("qa_expected") or step.get("expected"))
     if not source:
         return "기대결과가 없어 통과 기준을 정할 수 없습니다. 원본 TC에 기대결과가 필요합니다."
-    # A display-only expected result is not a score-calculation test just because
-    # its category/purpose mentions calculation. Otherwise resolve terse references.
-    if not re.search(r"표시|노출|보여|보인다|존재", source):
-        source += " " + text(step.get("test_purpose"))
+    # Reference metadata must not introduce additional acceptance requirements.
     if re.search(r"정확|일치|동일|반영|계산|산출|환산|보간|반올림|중복\s*제외|분모|분자|가중|추정|정합", source) and re.search(
             r"점수|정답률|데이터|환산|보간|반올림|중복\s*제외|분모|분자|계산|산출|가중치|합계|합산|평균", source):
         return "원본 학습 데이터와 계산 기준/환산표가 필요합니다. 현재 화면 문구만으로 데이터 정합성을 검증할 수 없습니다."
@@ -115,7 +113,7 @@ def needs_visual_verification(step):
     expected = text(step.get("qa_expected") or step.get("expected"))
     if not expected:
         return False
-    context = expected + " " + text(step.get("test_purpose"))
+    context = expected
     return bool(re.search(r"카드|막대|그래프|레이아웃|배치|색상|테두리|토글|아이콘|이미지|오른쪽|왼쪽|상단|하단|한\s*페이지|선택.*상태|Figma|애니메이션", context, re.I))
 
 

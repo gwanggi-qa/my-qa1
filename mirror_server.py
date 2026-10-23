@@ -44,6 +44,9 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 from flask_socketio import SocketIO, emit
 from local_access import LocalAccessPolicy
 import local_access_config
+import app_analysis
+import tc_workflow
+from ai_request_errors import AIRequestError, DRAFT_TIMEOUT_S, cli_error_code
 
 
 FPS = 10
@@ -77,6 +80,11 @@ local_access = LocalAccessPolicy(local_access_config.BIND_ADDRESS, local_access_
                                  local_access_config.BROWSER_HOSTNAMES, local_access_config.ALLOWED_NETWORKS)
 socketio = SocketIO(app, cors_allowed_origins=sorted(local_access.origins), async_mode="threading")
 local_access.install(app)
+app_analysis.register(app, local_access,
+                      ai_runner=lambda *args: request_draft_ai_json(*args),
+                      ai_status=lambda: {**codex_chatgpt_status(), **test_ai_identity()} if AI_PROVIDER == 'codex_cli'
+                      else {'configured': AI_PROVIDER == 'openai_api' and bool(os.environ.get('OPENAI_API_KEY')),
+                            **test_ai_identity()})
 
 _streaming = False
 _mirror_lock = threading.Lock()
@@ -101,6 +109,8 @@ _codex_status_cache: dict[str, Any] = {}
 _test_history_lock = threading.Lock()
 _redmine_failures_lock = threading.Lock()
 _redmine_publish_lock = threading.Lock()
+_redmine_review_session = uuid.uuid4().hex
+_redmine_review_run_id = None
 _record_play_lock = threading.Lock()
 _record_play_running = False
 _record_play_stop_event = threading.Event()
@@ -1277,12 +1287,14 @@ def codex_chatgpt_status(force=False):
             ).casefold()
             status.update({
                 "configured": logged_in,
+                "error_code": None if logged_in else "authentication",
                 "state": "ready" if logged_in else "unavailable",
                 "message": "Codex CLI: ChatGPT login ready" if logged_in else (
                     "Run codex login with ChatGPT as the same Windows user running this server."
                 ),
             })
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            status['error_code'] = 'timeout' if isinstance(exc, subprocess.TimeoutExpired) else 'cli_execution'
             status["message"] = "Codex login status timed out" if isinstance(exc, subprocess.TimeoutExpired) else str(exc)
         _codex_status_cache.update({"checked_at": now, "status": status})
         return dict(status)
@@ -1752,8 +1764,72 @@ def safe_redmine_failure_id(value):
     return failure_id
 
 
+class ReviewResetRequired(ValueError):
+    def __init__(self, state):
+        super().__init__('이전 회차의 미처리 Fail Review가 있습니다. 목록 초기화를 확인하세요.')
+        self.state = state
+
+
+def _active_redmine_failures(items):
+    return [item for item in items if item.get('review_session') == _redmine_review_session
+            and (item.get('run') or {}).get('id') == _redmine_review_run_id]
+
+
+def _redmine_review_state(items):
+    active = _active_redmine_failures(items)
+    return {'run_id': _redmine_review_run_id, 'total': len(active),
+            'pending': sum(not (i.get('redmine') or {}).get('issue_id') and i.get('status') != 'not_an_issue' for i in active),
+            'token': execution_results.fingerprint([_redmine_review_session, _redmine_review_run_id, active])}
+
+
+def redmine_review_state():
+    with _redmine_failures_lock:
+        return _redmine_review_state(_load_redmine_failures_unlocked())
+
+
+def require_review_reset_confirmation(payload):
+    if _redmine_publish_lock.locked():
+        raise ValueError('Redmine 발행 또는 연결 처리 중입니다. 완료 후 실행하세요.')
+    state = redmine_review_state()
+    if state['pending'] and not (payload.get('review_reset_confirmed') is True and payload.get('review_reset_token') == state['token']):
+        raise ReviewResetRequired(state)
+    return state['token']
+
+
+def begin_redmine_review_run(run_id, token):
+    """Rotate the visible queue, retaining evidence and issue links for results."""
+    global _redmine_review_run_id
+    if not _redmine_publish_lock.acquire(blocking=False):
+        raise ValueError('Redmine 발행 처리 중입니다. 완료 후 다시 실행하세요.')
+    try:
+        with _redmine_failures_lock:
+            if _redmine_review_state(_load_redmine_failures_unlocked())['token'] != token:
+                raise ValueError('Fail Review 상태가 변경되었습니다. 실행 확인을 다시 진행하세요.')
+            _redmine_review_run_id = run_id
+    finally:
+        _redmine_publish_lock.release()
+    socketio.emit('fail_review_changed', {'run_id': run_id}, namespace='/mirror')
+
+
+def require_active_redmine_failure(record):
+    if not _active_redmine_failures([record]):
+        raise ValueError('이전 회차 기록입니다. 결과 페이지에서 확인하세요.')
+
+
+def attach_redmine_result_links(runs):
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+    for run in runs:
+        related = [i for i in items if (i.get('run') or {}).get('id') == run.get('run_id')]
+        for case in run.get('results', []):
+            case['redmine_reviews'] = [{'failure_id': i['id'], 'status': i.get('status'),
+                'issue': copy.deepcopy(i.get('redmine') or {}), 'latest_retest': copy.deepcopy(i.get('latest_retest')),
+                'evidence': copy.deepcopy(i.get('evidence') or {})} for i in related
+                if (i.get('run') or {}).get('step_index') == case.get('index')]
+
+
 def test_case_identity(step, index):
-    for key in ("tc_id", "case_id", "id", "step", "row"):
+    for key in ("tc_id", "case_id", "case_no", "id", "step", "row"):
         value = str(step.get(key) or "").strip()
         if value:
             return value
@@ -1819,16 +1895,17 @@ def redmine_related_issue(items, testcase_key, test_case_id):
     return None
 
 
-def queue_test_failure(run_id, index, total, step, message, elapsed_ms, extra, metadata, mode):
+def queue_test_failure(run_id, index, total, step, message, elapsed_ms, extra, metadata, mode, device_evidence=None):
     testcase_key = str(metadata.get("file_hash") or metadata.get("filename") or "current-testcase")
     test_case_id = test_case_identity(step, index)
-    expected = str(step.get("expected") or step.get("qa_expected") or step.get("target") or step.get("value") or "").strip()
+    expected = str(step.get("qa_expected") or step.get("expected") or step.get("target") or step.get("value") or "").strip()
     now = datetime.now().isoformat(timespec="seconds")
     with _redmine_failures_lock:
         items = _load_redmine_failures_unlocked()
         related_issue = redmine_related_issue(items, testcase_key, test_case_id)
         record = {
             "id": f"failure-{uuid.uuid4().hex[:12]}",
+            "review_session": _redmine_review_session,
             "status": "pending_review",
             "created_at": now,
             "updated_at": now,
@@ -1852,13 +1929,13 @@ def queue_test_failure(run_id, index, total, step, message, elapsed_ms, extra, m
             },
             "expected_result": expected,
             "actual_result": str(message or ""),
-            "reproduction": default_reproduction_path(step, index),
+            "reproduction": extra.get('reproduction') or default_reproduction_path(step, index),
             "evidence": {
                 "screenshot_file": extra.get("screenshot_file", ""),
                 "screenshot_url": extra.get("screenshot_url", ""),
                 "screenshot_path": extra.get("screenshot", ""),
             },
-            "device": failure_device_evidence(),
+            "device": device_evidence if device_evidence is not None else failure_device_evidence(),
             "redmine": {},
             "retests": [],
         }
@@ -1866,7 +1943,28 @@ def queue_test_failure(run_id, index, total, step, message, elapsed_ms, extra, m
             record["related_issue"] = related_issue
         items.append(record)
         _write_redmine_failures_unlocked(items)
+    socketio.emit('fail_review_changed', {'run_id': run_id}, namespace='/mirror')
     return record
+
+
+def record_tc_review_result(run, case, step, metadata, mode):
+    """Failure review is secondary; recording problems must not change verdicts."""
+    try:
+        latest = next((e for e in reversed(case.get('evidence', [])) if e.get('url') or e.get('file')), {})
+        extra = {'screenshot_file': latest.get('file', ''), 'screenshot_url': latest.get('url', '')}
+        source = case.get('source') or {}
+        extra['reproduction'] = '사전조건: '+str(source.get('precondition') or '(명시 없음)')+'\n테스트절차:\n'+str(source.get('procedure') or step.get('test_item') or default_reproduction_path(step,case['index']))
+        if case['status'] == 'failed':
+            env = run.get('environment') or {}
+            device, app_info = env.get('device') or {}, env.get('app') or {}
+            device = {**device, 'app_package': app_info.get('package', ''), 'app_version': app_info.get('version', '')}
+            failure = queue_test_failure(run['run_id'], case['index'], len(run['results']), step,
+                case.get('reason') or case.get('actual', ''), 0, extra, metadata, mode, device_evidence=device)
+            case['redmine_failure_id'] = failure['id']
+        if case['status'] in {'passed', 'failed'}:
+            record_linked_retest(metadata, step, case['index'], case['status'], case.get('actual') or case.get('reason', ''), extra)
+    except Exception:
+        case['review_error'] = 'Fail Review 기록을 저장하지 못했습니다. 실행 결과와 캡처를 확인하세요.'
 
 
 def record_linked_retest(metadata, step, index, status, message, extra=None):
@@ -1981,7 +2079,7 @@ def sync_redmine_retest_event(testcase_key, test_case_id, issue_id, event_id):
 
 def list_redmine_failures():
     with _redmine_failures_lock:
-        return list(reversed(_load_redmine_failures_unlocked()))
+        return list(reversed(_active_redmine_failures(_load_redmine_failures_unlocked())))
 
 
 def update_redmine_failure(failure_id, payload):
@@ -2000,6 +2098,7 @@ def update_redmine_failure(failure_id, payload):
         record = next((item for item in items if item.get("id") == failure_id), None)
         if not record:
             raise FileNotFoundError("Failure review item not found.")
+        require_active_redmine_failure(record)
         review = record.setdefault("review", {})
         for key, maximum in allowed_text.items():
             if key in payload:
@@ -2203,6 +2302,7 @@ def create_redmine_issue(failure_id, payload):
             record = next((item for item in items if item.get("id") == failure_id), None)
             if not record:
                 raise FileNotFoundError("Failure review item not found.")
+            require_active_redmine_failure(record)
             if record.get("status") == "not_an_issue":
                 raise RuntimeError("This item is marked Not an Issue.")
             if (record.get("redmine") or {}).get("issue_id"):
@@ -2287,6 +2387,11 @@ def finalize_redmine_failure(failure_id, issue_data, status):
 
 
 def link_redmine_issue(failure_id, payload):
+    with _redmine_publish_lock:
+        return _link_redmine_issue(failure_id, payload)
+
+
+def _link_redmine_issue(failure_id, payload):
     issue_id = str(payload.get("issue_id") or "").strip()
     if not issue_id.isdigit():
         raise ValueError("issue_id must be a numeric Redmine issue id.")
@@ -2814,9 +2919,11 @@ def parse_openai_json(text):
     return data
 
 
-def request_openai_json(instructions, context, max_output_tokens=2400, image_png=None):
+def request_openai_json(instructions, context, max_output_tokens=2400, image_png=None, *, timeout_s=None):
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
+        if timeout_s is not None:
+            raise AIRequestError('authentication')
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
     content = [
@@ -2850,9 +2957,13 @@ def request_openai_json(instructions, context, max_output_tokens=2400, image_png
         method="POST",
     )
     try:
-        with urllib.request.urlopen(http_request, timeout=AI_REQUEST_TIMEOUT_S) as response:
+        with urllib.request.urlopen(http_request, timeout=AI_REQUEST_TIMEOUT_S if timeout_s is None else timeout_s) as response:
             response_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if timeout_s is not None:
+            code = {401: 'authentication', 403: 'authentication', 429: 'usage_limit',
+                    408: 'timeout', 504: 'timeout', 502: 'connection', 503: 'connection'}.get(exc.code, 'unknown')
+            raise AIRequestError(code) from None
         message = f"OpenAI API returned HTTP {exc.code}"
         try:
             error_data = json.loads(exc.read().decode("utf-8", errors="ignore"))
@@ -2863,10 +2974,17 @@ def request_openai_json(instructions, context, max_output_tokens=2400, image_png
             pass
         raise RuntimeError(message) from exc
     except (OSError, ValueError) as exc:
+        if timeout_s is not None:
+            code = 'invalid_response' if isinstance(exc, ValueError) else 'connection'
+            if isinstance(exc, TimeoutError) or isinstance(getattr(exc, 'reason', None), TimeoutError):
+                code = 'timeout'
+            raise AIRequestError(code) from None
         raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
 
     output_text = extract_openai_output_text(response_data)
     if not output_text:
+        if timeout_s is not None:
+            raise AIRequestError('invalid_response')
         raise RuntimeError("OpenAI API returned no JSON output")
     return parse_openai_json(output_text), response_data.get("usage") or {}
 
@@ -2906,11 +3024,13 @@ def request_codex_random_json(instructions, context, metrics):
     return request_codex_json(instructions, context, metrics, schema, _random_stop_event, RandomStopped)
 
 
-def request_codex_json(instructions, context, metrics, schema, stop_event, stop_type, image_png=None):
+def request_codex_json(instructions, context, metrics, schema, stop_event, stop_type, image_png=None, *, timeout_s=None):
     if stop_event.is_set():
         raise stop_type("Stopped before Codex planning")
     status = codex_chatgpt_status(force=True)
     if not status["configured"]:
+        if timeout_s is not None:
+            raise AIRequestError(status.get('error_code') or 'unknown')
         raise RuntimeError(status["message"])
     prompt = (
         instructions + "\nOnly return the plan; do not use tools or execute any test. "
@@ -2922,7 +3042,7 @@ def request_codex_json(instructions, context, metrics, schema, stop_event, stop_
         output_file = Path(folder) / "plan.json"
         schema_file.write_text(json.dumps(schema), encoding="utf-8")
         command = [
-            codex_executable(), "-a", "never", "exec", "--ignore-user-config",
+            codex_executable(), "--no-daemon", "-a", "never", "exec", "--ignore-user-config",
             "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
             "--cd", folder, "--json", "--color", "never",
             "--output-schema", str(schema_file), "--output-last-message", str(output_file),
@@ -2944,22 +3064,32 @@ def request_codex_json(instructions, context, metrics, schema, stop_event, stop_
         command.append("-")
         if stop_event.is_set():
             raise stop_type("Stopped before Codex planning")
-        process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", cwd=folder,
-            env=codex_process_environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", cwd=folder,
+                env=codex_process_environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            if timeout_s is not None:
+                raise AIRequestError('cli_execution') from None
+            raise
         metrics["planner_calls"] += 1
-        deadline = time.monotonic() + CODEX_REQUEST_TIMEOUT_S
+        limit = CODEX_REQUEST_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + limit
         next_input = prompt
         try:
             while True:
                 if stop_event.is_set():
                     raise stop_type("Stopped during Codex planning")
                 if time.monotonic() >= deadline:
+                    if timeout_s is not None:
+                        raise AIRequestError('timeout')
                     raise RuntimeError(f"Codex planning timed out after {CODEX_REQUEST_TIMEOUT_S}s")
                 try:
                     stdout, stderr = process.communicate(input=next_input, timeout=0.2)
+                    if timeout_s is not None and time.monotonic() >= deadline:
+                        raise AIRequestError('timeout')
                     break
                 except subprocess.TimeoutExpired:
                     next_input = None
@@ -2992,14 +3122,55 @@ def request_codex_json(instructions, context, metrics, schema, stop_event, stop_
         if process.returncode != 0 or not completed:
             # Never return raw CLI logs, which can contain auth or local configuration details.
             diagnostic = (stdout + stderr).casefold()
+            if timeout_s is not None:
+                raise AIRequestError(cli_error_code(diagnostic))
             if any(text in diagnostic for text in ("usage limit", "rate limit", "quota", "usage_limit")):
                 raise RuntimeError("Codex usage limit reached. Wait for the account limit to reset.")
             if any(text in diagnostic for text in ("unauthorized", "not logged", "401", "refresh token")):
                 raise RuntimeError("Codex ChatGPT login expired. Run codex login again.")
             raise RuntimeError(f"Codex planning failed (exit {process.returncode}); check CLI login/network/version.")
         if not output_file.is_file():
+            if timeout_s is not None:
+                raise AIRequestError('invalid_response')
             raise RuntimeError("Codex returned no plan")
         return parse_openai_json(output_file.read_text(encoding="utf-8")), metrics.get("usage", {})
+
+
+def request_draft_ai_json(instructions, context, metrics, schema, stop_event, stop_type, image_png=None):
+    if stop_event.is_set():
+        raise stop_type('Draft generation stopped')
+    if AI_PROVIDER == 'codex_cli':
+        return request_codex_json(instructions, context, metrics, schema, stop_event, stop_type, image_png,
+                                  timeout_s=DRAFT_TIMEOUT_S)
+    if AI_PROVIDER == 'openai_api':
+        metrics['planner_calls'] += 1
+        # A bounded wait also handles slow response bodies. Late HTTP responses never update a job.
+        done, outcome = threading.Event(), []
+        def call_api():
+            try:
+                outcome.append((True, request_openai_json(instructions, context, 10000, image_png,
+                                                         timeout_s=DRAFT_TIMEOUT_S)))
+            except Exception as exc:
+                outcome.append((False, exc))
+            finally:
+                done.set()
+        deadline = time.monotonic() + DRAFT_TIMEOUT_S
+        threading.Thread(target=call_api, daemon=True).start()
+        while True:
+            if stop_event.is_set():
+                raise stop_type('Draft generation stopped')
+            if time.monotonic() >= deadline:
+                raise AIRequestError('timeout')
+            if done.wait(0.1):
+                if stop_event.is_set():
+                    raise stop_type('Draft generation stopped')
+                if time.monotonic() >= deadline:
+                    raise AIRequestError('timeout')
+                success, value = outcome[0]
+                if not success:
+                    raise value
+                return value
+    raise RuntimeError('Unsupported AI_PROVIDER')
 
 
 def request_ai_random_plan(context, metrics):
@@ -3219,7 +3390,7 @@ def emit_test_ai_status(state, message, **extra):
     socketio.emit("test_ai_status", payload, namespace="/mirror")
 
 
-def request_test_ai_json(instructions, context, schema, max_output_tokens=2400, image_png=None):
+def request_test_ai_json(instructions, context, schema, max_output_tokens=2400, image_png=None, *, validate_response=True):
     ai_tc.check_stop(sys.modules[__name__])
     metrics = getattr(_test_ai_context, "metrics", None)
     if metrics is None:
@@ -3239,7 +3410,8 @@ def request_test_ai_json(instructions, context, schema, max_output_tokens=2400, 
     metrics["usage"] = {key: previous_usage.get(key, 0) + usage.get(key, 0)
                         for key in set(previous_usage) | set(usage)
                         if type(usage.get(key, 0)) is int}
-    ai_tc.validate(data, schema)
+    if validate_response:
+        ai_tc.validate(data, schema)
     return data, usage
 
 
@@ -3377,6 +3549,21 @@ def ai_test_screen_candidates():
                 if attrs.get("enabled") == "false":
                     continue
                 label = attrs.get("text") or attrs.get("content-desc") or ""
+                if (not label and attrs.get("clickable") == "true"
+                        and not tc_workflow.RISK.search(attrs.get("resource-id", ""))
+                        and attrs.get("password") != "true"
+                        and attrs.get("visible-to-user") != "false"
+                        and not any(c.get("text") or c.get("content-desc") for c in node.iter("node") if c is not node)):
+                    bounds = attrs.get("bounds", "")
+                    rect = parse_bounds(bounds)
+                    center = bounds_center(bounds)
+                    if (rect and center and 0 <= rect[0] < rect[2] and 0 <= rect[1] < rect[3]
+                            and attrs.get("package") not in {"com.android.systemui", "com.android.permissioncontroller"}):
+                        candidates.append({"label": "Unlabeled control " + attrs.get("resource-id", ""),
+                                           "action": "tap", "bounds": bounds, "source": "ui-icon",
+                                           "visual_identification_required": True,
+                                           "class": attrs.get("class", ""),
+                                           "resource_id": attrs.get("resource-id", ""), **center})
                 if label:
                     ancestor = node
                     while ancestor in parents and ancestor.get("clickable") != "true":
@@ -3408,7 +3595,7 @@ def ai_test_screen_candidates():
         safe.append(item)
         if len(safe) >= 100:
             break
-    context = [{key: item.get(key) for key in ("candidate_id", "label", "action", "source", "bounds")}
+    context = [{key: item.get(key) for key in ("candidate_id", "label", "action", "source", "bounds", "visual_identification_required", "class", "resource_id")}
                for item in safe]
     return safe, context
 
@@ -5791,6 +5978,19 @@ HTML = r"""
     .review-panel summary { cursor:pointer; font-weight:700; }
     .review-panel button { max-width:100%; padding:7px; margin:4px 3px 4px 0; }
     .review-panel pre { overflow-wrap:anywhere; }
+    .workspace-body { overflow-y:auto; overflow-x:hidden; scrollbar-gutter:stable; }
+    .workspace-body > :not(.tab-pane) { flex-shrink:0; }
+    #tab-test-case { flex:1 0 auto; }
+    #tab-test-case > * { flex-shrink:0; }
+    #tab-test-case .case-panel { flex:1 0 220px; min-height:220px; max-height:420px; }
+    #tc-flow input[type="checkbox"], .tc-flow-selection {
+      width:16px; height:16px; min-width:16px; max-width:16px; flex:0 0 16px;
+      padding:0; margin:2px 0; accent-color:#6dd5b0;
+    }
+    #tc-flow label { align-items:flex-start; line-height:1.5; }
+    #tc-flow button { padding:0 10px; max-width:100%; font-size:12px; }
+    #tc-flow-plan { margin-top:10px; }
+    #tc-flow-plan summary { cursor:pointer; font-size:12px; }
     @media(max-width:900px) {
       .app { grid-template-rows:minmax(290px,42vh) minmax(360px,1fr); overflow-y:auto; }
       .view-header { gap:7px; padding:8px; }
@@ -5808,6 +6008,7 @@ HTML = r"""
       <button id="test-execution-tab" type="button" role="tab" aria-selected="true" aria-controls="test-execution-panel">테스트 실행</button>
       <button id="execution-open" type="button" role="tab" aria-selected="false" aria-controls="execution-panel" tabindex="-1">대시보드</button>
     </nav>
+    <a href="/app-analysis" id="apk-analysis-link" style="color:#9de6d3;white-space:nowrap;padding:8px">APK 분석</a>
     <div id="view-runtime-status" role="status" aria-live="polite">상태 확인 중</div>
     <div id="view-stop-controls" aria-label="실행 중단 controls"></div>
   </header>
@@ -5869,9 +6070,26 @@ HTML = r"""
             <button class="btn-secondary" id="btn-test-stop" type="button" onclick="stopTestCase()" disabled><span class="ui-icon icon-stop" aria-hidden="true"></span>Stop</button>
           </div>
           <div class="test-ai-state" id="test-ai-state">AI TC: Checking</div>
+          <section id="tc-flow" aria-label="TC 실행 흐름" style="border-block:1px solid #3b414a;padding:10px 0;min-width:0">
+            <div id="tc-flow-steps" style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px" aria-label="단계">
+              <span data-phase="selection">TC 선택</span><span aria-hidden="true">→</span>
+              <span data-phase="preparing">절차 준비</span><span aria-hidden="true">→</span>
+              <span data-phase="ready">계획 확인</span><span aria-hidden="true">→</span>
+              <span data-phase="running">실행·기대결과 판정</span><span aria-hidden="true">→</span>
+              <span data-phase="finished">완료</span>
+            </div>
+            <p id="tc-flow-message" role="status" style="font-size:12px;overflow-wrap:anywhere">업로드 대기</p>
+            <label style="display:flex;gap:6px;font-size:12px"><input type="checkbox" id="tc-flow-consent">선택 TC와 실행 중 화면의 AI 분석·사용량 발생에 동의</label>
+            <details id="tc-flow-plan" hidden><summary>TC별 사전조건·절차·기대결과</summary><div id="tc-flow-cases" style="max-height:280px;overflow:auto;font-size:12px"></div></details>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+              <button class="btn-run" type="button" id="tc-flow-start" disabled>계획 확인 후 실행</button>
+              <button class="btn-secondary" type="button" id="tc-flow-stop" disabled>준비·실행 중단</button>
+              <button class="btn-secondary" type="button" id="tc-flow-export" disabled>실행결과 Excel</button>
+            </div>
+          </section>
           <div class="test-resolution-state" id="test-resolution-state" hidden></div>
           <div class="redmine-review-bar">
-            <span id="redmine-review-status">Fail review: checking</span>
+            <span id="redmine-review-status">이번 회차 검토: 확인 중</span>
             <div class="redmine-review-actions">
               <button class="btn-secondary" id="btn-redmine-connection" type="button" onclick="testRedmineConnection()">Test connection</button>
               <button class="btn-redmine" id="btn-redmine-review" type="button" onclick="openRedmineReview()"><span class="ui-icon icon-redmine" aria-hidden="true"></span>Fail Review <span id="redmine-failure-count">0</span></button>
@@ -6064,7 +6282,7 @@ HTML = r"""
   <div class="review-modal-backdrop" id="redmine-review-modal" hidden>
     <section class="review-modal" role="dialog" aria-modal="true" aria-labelledby="redmine-review-title">
       <header class="review-modal-header">
-        <h2 id="redmine-review-title">Fail Review / Redmine</h2>
+        <h2 id="redmine-review-title">이번 회차 Fail Review / Redmine</h2>
         <button type="button" onclick="closeRedmineReview()" aria-label="Close fail review">x</button>
       </header>
       <div class="review-modal-body">
@@ -6527,10 +6745,30 @@ HTML = r"""
       }
     }
 
+    let redmineRefreshVersion = 0;
+    socket.on('fail_review_changed', () => { refreshRedmineReview(); });
+
+    window.startTestWithReview = async function(url, payload) {
+      const send = body => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+      let response = await send(payload);
+      if (response.status === 409) {
+        const data = await response.clone().json();
+        if (data.code === 'fail_review_reset_required') {
+          if (!window.confirm(`이전 회차에 미처리 Fail Review ${data.review.pending}건이 있습니다. 새 테스트를 시작하면 등록 완료 항목을 포함한 검토 목록이 초기화됩니다. Redmine 실제 이슈와 결과·증거는 유지됩니다. 계속할까요?`)) {
+            throw new Error('새 실행을 취소했습니다. 이전 검토 목록을 유지합니다.');
+          }
+          response = await send({...payload, review_reset_confirmed:true, review_reset_token:data.review.token});
+        }
+      }
+      return response;
+    };
+
     async function refreshRedmineReview() {
+      const version = ++redmineRefreshVersion;
       try {
         const response = await fetch('/api/redmine/failures');
         const data = await response.json();
+        if (version !== redmineRefreshVersion) return;
         if (!response.ok) {
           throw new Error(data.error || 'Failed to load fail review');
         }
@@ -6543,9 +6781,9 @@ HTML = r"""
         } else {
           redmineOptions = { projects: [], trackers: [], priorities: [], assignees: [] };
         }
-        renderRedmineReview();
+        if (version === redmineRefreshVersion) renderRedmineReview();
       } catch (error) {
-        redmineReviewStatus.textContent = 'Fail review: unavailable';
+        if (version === redmineRefreshVersion) redmineReviewStatus.textContent = '이번 회차 검토: 조회 실패';
       }
     }
 
@@ -6598,12 +6836,13 @@ HTML = r"""
       const linked = redmineFailures.filter((item) => (item.redmine || {}).issue_id).length;
       redmineFailureCount.textContent = pending;
       redmineReviewStatus.textContent = redmineConfig.configured
-        ? `Fail review: ${pending} pending / ${linked} linked`
-        : `Fail review: ${pending} pending / Redmine configuration required`;
+        ? `이번 회차 검토: 대기 ${pending} / 등록 ${linked}`
+        : `이번 회차 검토: 대기 ${pending} / Redmine 설정 필요`;
 
       if (!redmineFailures.length) {
-        redmineFailureList.innerHTML = '<div class="empty">No failed Test Case evidence recorded.</div>';
-        redmineFailureDetail.innerHTML = '<div class="empty">Run a Test Case. Failed steps will appear here with their capture and context.</div>';
+        selectedRedmineFailureId = null;
+        redmineFailureList.innerHTML = '<div class="empty">이번 회차의 실패 검토 항목이 없습니다.</div>';
+        redmineFailureDetail.innerHTML = '<div class="empty">검토 대기 항목 없음</div>';
         return;
       }
       if (!redmineFailures.some((item) => item.id === selectedRedmineFailureId)) {
@@ -6961,11 +7200,12 @@ HTML = r"""
     }
 
     function acceptUploadedTestCase(data) {
+      loadedSteps = data.steps || [];
+      window.dispatchEvent(new CustomEvent('tc-uploaded',{detail:data}));
       reviewedHash = (data.metadata || {}).file_hash || null;
       reviewedPlan = null; reviewedObservation = null;
       workbookRunId = null;
       setWorkbookExport(null, (data.metadata || {}).workbook_export_error || '');
-      loadedSteps = data.steps || [];
       renderCases(loadedSteps);
       renderProgress(loadedSteps, 'waiting');
       updateRecorderResolutionState(data.recorder_resolution);
@@ -6991,6 +7231,7 @@ HTML = r"""
       }
       const data = await response.json();
       loadedSteps = data.steps || [];
+      window.dispatchEvent(new CustomEvent('tc-uploaded',{detail:data}));
       reviewedHash = (data.metadata || {}).file_hash || null;
       workbookRunId = data.workbook_export ? data.workbook_export.run_id : null;
       setWorkbookExport(data.workbook_export || null, (data.metadata || {}).workbook_export_error || '');
@@ -7028,6 +7269,11 @@ HTML = r"""
     }
 
     async function runTestCase(aiMode = false) {
+      if (loadedSteps.length && loadedSteps.every(s=>s.source==='narrative_qa')) {
+        if(window.tcWorkflow) await window.tcWorkflow.prepare(aiMode);
+        else statusLabel.textContent='실행 UI 준비 중입니다. 잠시 후 다시 시도하세요.';
+        return;
+      }
       if (reviewedHash || aiMode) { await prepareReviewed(aiMode); return; }
       if (!loadedSteps.length) {
         statusLabel.textContent = 'Upload a test case first.';
@@ -7661,8 +7907,10 @@ HTML = r"""
     }
 
     function narrativeCase(step) {
-      const fields = [['목적', step.test_purpose], ['사전조건', step.precondition], ['절차', step.test_item],
+      const fields = [['우선순위',step.priority], ['Depth',(step.depths || []).filter(Boolean).join(' > ')], ['Type',step.check_type],
+        ['목적', step.test_purpose], ['사전조건', step.precondition], ['절차', step.test_item],
         ['기대결과', step.expected], ['자동화가능', step.automation_possible],
+        ['원본 수동 결과',step.qa_result], ['원본 자동화 결과',step.automation_result],
         ['상태', step.visual_verification ? `화면 검증 대기${step.verification_gap ? ' / ' + step.verification_gap : ''}` : (step.verification_gap || (step.ai_pending ? 'AI 분석 대기' : step.action))]];
       return `<details class="narrative-case"><summary>${escapeHtml(step.case_no || 'TC')} · ${escapeHtml(step.title || step.test_purpose || '')} <small>(${escapeHtml(step.sheet)}:${step.row})</small></summary><dl>${fields.map(([label,value]) => `<dt>${label}</dt><dd>${escapeHtml(value || '-')}</dd>`).join('')}</dl></details>`;
     }
@@ -7675,7 +7923,7 @@ HTML = r"""
       }
 
       caseList.innerHTML = steps.map((step, index) => {
-        if (step.source === 'narrative_qa') return narrativeCase(step);
+        if (step.source === 'narrative_qa') return `<div style="display:grid;grid-template-columns:24px minmax(0,1fr);align-items:start"><input class="tc-flow-selection" type="checkbox" value="${index+1}" aria-label="${escapeHtml(step.case_no || String(index+1))} 선택" ${index<20?'checked':''}>${narrativeCase(step)}</div>`;
         const label = step.description || step.expected || step.target || step.value || '-';
         return `
           <div class="case-row">
@@ -7801,6 +8049,11 @@ HTML = r"""
       workbookExport = info;
       document.getElementById('btn-workbook-export').disabled = !info;
       const note = document.getElementById('workbook-export-note');
+      if ((info && info.workflow_id) || (!info && loadedSteps.length && loadedSteps.every(s => s.source === 'narrative_qa'))) {
+        note.textContent = info ? '실행결과 Excel 준비 완료 · 기대결과와 실제 판정은 별도 열에 저장됩니다.'
+          : '기대결과 기준 판정 · 원본에 검증결과 열 불필요 · 실행결과는 별도 저장됩니다.';
+        return;
+      }
       note.textContent = error
         ? `결과 Excel 다운로드 불가: ${error}`
         : info
@@ -7814,7 +8067,9 @@ HTML = r"""
       const button = document.getElementById('btn-workbook-export');
       button.disabled = true;
       try {
-        const response = await fetch(`/api/test-runs/${encodeURIComponent(info.run_id)}/workbook?file_hash=${encodeURIComponent(info.file_hash)}`);
+        const response = await fetch(info.workflow_id
+          ? `/api/tc-workflow/${encodeURIComponent(info.workflow_id)}/export`
+          : `/api/test-runs/${encodeURIComponent(info.run_id)}/workbook?file_hash=${encodeURIComponent(info.file_hash)}`);
         if (!response.ok) {
           const data = await response.json();
           throw new Error(data.error || '결과 Excel 다운로드 실패');
@@ -7829,7 +8084,8 @@ HTML = r"""
         link.click();
         link.remove();
         URL.revokeObjectURL(url);
-        statusLabel.textContent = '원본을 보존한 결과 Excel 사본을 내려받았습니다. Excel에서 집계 재계산과 과목 필터를 확인하세요.';
+        statusLabel.textContent = info.workflow_id ? '기대결과와 실제 판정을 분리한 결과 Excel을 내려받았습니다.'
+          : '원본을 보존한 결과 Excel 사본을 내려받았습니다. Excel에서 집계 재계산과 과목 필터를 확인하세요.';
       } catch (error) {
         statusLabel.textContent = error.message;
       } finally {
@@ -8058,7 +8314,7 @@ HTML = r"""
 def index():
     html = HTML.replace("<head>", '<head><meta name="qa-csrf-token" content="' + local_access.token + '">'
                         '<script src="/static/local-request.js"></script>', 1)
-    html = html.replace("</body>", '<script src="/execution-dashboard.js" defer></script></body>')
+    html = html.replace("</body>", '<script src="/execution-dashboard.js" defer></script><script src="/static/tc-workflow.js" defer></script></body>')
     return local_access.bootstrap(Response(render_template_string(html), mimetype="text/html"))
 
 
@@ -8121,7 +8377,12 @@ def redmine_options():
 
 @app.route("/api/redmine/failures")
 def redmine_failures():
-    return jsonify({"failures": list_redmine_failures(), "redmine": redmine_status_payload()})
+    with _redmine_failures_lock:
+        items = _load_redmine_failures_unlocked()
+        response = jsonify({"failures": list(reversed(_active_redmine_failures(items))),
+                            "review": _redmine_review_state(items), "redmine": redmine_status_payload()})
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 
 @app.route("/api/redmine/failures/<failure_id>", methods=["PATCH"])
@@ -8197,6 +8458,7 @@ def execution_results_api():
                        current_step=plan.action_cursor + 1 if not plan.finished else None)
     if current:
         history = [r for r in history if r["run_id"] != current["run_id"]]
+    attach_redmine_result_links(([current] if current else []) + history)
     return jsonify({"current": current, "history": history, "warnings": warnings,
                     "upload_id": _test_metadata.get("upload_id"), "file_hash": _test_metadata.get("file_hash")})
 
@@ -8223,13 +8485,16 @@ def execution_start():
             return jsonify({"error": "Another automation is active"}), 409
         with _test_lock:
             metadata, steps, template = copy.deepcopy(_test_metadata), copy.deepcopy(_test_steps), _test_workbook
-        if set(payload) != {"upload_id", "file_hash", "selection", "mappings"} or not metadata.get("upload_id"):
+        if set(payload)-{'review_reset_token','review_reset_confirmed'} != {"upload_id", "file_hash", "selection", "mappings"} or not metadata.get("upload_id"):
             return jsonify({"error": "Explicit upload, TC selection and reviewed mappings required"}), 400
         if payload["upload_id"] != metadata.get("upload_id") or payload["file_hash"] != metadata.get("file_hash"):
             return jsonify({"error": "Upload version changed"}), 409
         try:
             indexes = reviewed_tc.selected_rows(steps, payload["selection"])
             run = verified_execution.Run(sys.modules[__name__], [steps[i-1] for i in indexes], metadata, payload["mappings"])
+            run.review_reset_token = require_review_reset_confirmation(payload)
+        except ReviewResetRequired as exc:
+            return jsonify(error=str(exc), code='fail_review_reset_required', review=exc.state), 409
         except (ValueError, TypeError, KeyError) as exc:
             return jsonify({"error": str(exc)}), 400
         _verified_run, _test_running, _last_workbook_run = run, True, None
@@ -8542,6 +8807,8 @@ def stop_testcase():
     global _stop_generation
     _stop_generation += 1
     _test_stop_event.set()
+    if tc_workflow_service['current'] is not None:
+        tc_workflow_service['current'].stop()
     if _verified_run is not None and not _verified_run.finished:
         _verified_run.stop()
     if _reviewed_plan is not None and _reviewed_plan.approved and not _reviewed_plan.finished:
@@ -8553,6 +8820,9 @@ def stop_testcase():
 
 @app.route("/api/input", methods=["POST"])
 def manual_input():
+    flow = tc_workflow_service['current']
+    if flow is not None and flow.state == 'running':
+        return jsonify({'error':'TC 절차 실행 중에는 수동 입력을 잠시 제한합니다. Stop 후 조작하세요.'}),409
     if _reviewed_plan is not None and _reviewed_plan.approved and not _reviewed_plan.finished:
         return jsonify({"error": "검토 실행 중에는 승인된 현재 단계의 입력만 허용됩니다."}), 409
     payload = request.get_json(silent=True) or {}
@@ -8755,6 +9025,8 @@ def on_stop(data=None):
         return {"error": "page_verification_required"}
     _streaming = False
 
+
+tc_workflow_service = tc_workflow.register(app, lambda: sys.modules[__name__])
 
 if __name__ == "__main__":
     print("=" * 55)

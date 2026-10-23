@@ -176,6 +176,9 @@ class Run:
             env = self.adapter.environment()
             with self.lock:
                 self.data['environment'] = env
+            self.guard()
+            if getattr(self,'review_reset_token',None) is not None:
+                self.host.begin_redmine_review_run(self.data['run_id'],self.review_reset_token)
             for case, mapping in zip(self.data['results'], self.mappings):
                 self.guard()
                 with self.lock:
@@ -244,6 +247,8 @@ class Run:
                         failed_stage = next((s for s in case['stages'] if s['status'] == 'blocked'), None)
                         if failed_stage:
                             case.update(error_kind=failed_stage['error_kind'], reason=failed_stage['actual'])
+                if getattr(self,'review_reset_token',None) is not None:
+                    self.host.record_tc_review_result(self.data,case,case['source']['original'],self.metadata,'reviewed')
                 if case['error_kind'] in {'environment', 'internal'}:
                     for remaining in self.data['results']:
                         if remaining['status'] == 'not_run':

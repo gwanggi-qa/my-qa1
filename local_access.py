@@ -92,12 +92,12 @@ class LocalAccessPolicy:
             return self.rejection(error)
         if request.routing_exception:
             return None  # Let Flask retain 404/405 semantics for authenticated requests.
-        if request.endpoint == "upload_testcase" and request.method == "POST":
+        if request.endpoint in {"upload_testcase", "app_analysis.builds", "app_analysis.references"} and request.method == "POST":
             if request.mimetype != "multipart/form-data":
                 return self.rejection("multipart_required", 415)
             if not request.mimetype_params.get("boundary"):
                 return self.rejection("multipart_boundary_required", 400)
-            return None  # Existing bounded workbook parser validates file and mapping.
+            return None  # Each upload handler applies its own bounded file parser.
         if request.mimetype != "application/json":
             return self.rejection("json_required", 415)
         try:
