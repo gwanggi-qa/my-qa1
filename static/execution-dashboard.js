@@ -48,6 +48,8 @@ mapping.append($('h3','원문에 고정된 검토 매핑'),$('p','기존 실행 
 const sources=$('button','업로드 원문·버전 확인'),sourceText=$('pre'),mapText=$('textarea'),confirm=$('input'),confirmLabel=$('label'),execute=$('button','검토 매핑으로 실행');mapText.id='execution-mapping-json';mapText.setAttribute('aria-label','검토된 매핑 JSON');mapText.placeholder='upload_id, file_hash, selection, mappings가 있는 JSON';confirm.type='checkbox';confirm.id='execution-mapping-confirm';confirmLabel.append(confirm,document.createTextNode(' 원문 전체와 실기기 매핑을 검토했습니다.'));execute.id='execution-mapping-start';mapping.append(sources,sourceText,mapText,confirmLabel,execute);
 let data={current:null,history:[]},selected='',detailIndex=null,detailSignature='',requestSerial=0,controller=null,timer=null,loaded=false,loadError='';
 const allRuns=()=>[...(data.current?[data.current]:[]),...list(data.history)].filter(r=>r&&typeof r.run_id==='string'&&Array.isArray(r.results));
+const projectFilter=$('select');projectFilter.setAttribute('aria-label','프로젝트 필터');topActions.prepend(projectFilter);option(projectFilter,'','전체 프로젝트');
+projectFilter.onchange=()=>{const choices=allRuns().filter(r=>!projectFilter.value||(r.project_id||'__unassigned')===projectFilter.value);selected=choices[0]?.run_id||'';runs.replaceChildren();for(const r of choices)option(runs,r.run_id,(r.project_id||'프로젝트 미지정')+' · '+formatTime(r.started_at)+' · '+r.run_id);runs.value=selected;closeDetail(false);render();};
 const currentRun=()=>allRuns().find(r=>r.run_id===selected);
 function showError(message){loadError=message;error.hidden=!message;error.textContent=message;}
 function metrics(run){const c=Object.fromEntries([...Object.keys(statusNames),'unknown'].map(k=>[k,0]));for(const r of list(run?.results))c[stateClass(r.status)]++;return c;}
@@ -86,6 +88,10 @@ function showDetail(run,r,index,focus=true){detailIndex=index;detailSignature=JS
  if(r.reason&&r.actual)field(inner,'사유',r.reason);if(r.error_kind)field(inner,'원인 종류',causeNames[r.error_kind]||r.error_kind);
  if(r.review_error)field(inner,'검토 기록 오류',r.review_error);
  redmineLinks(inner,r.redmine_reviews);
+ field(inner,'실제 입력 횟수',r.input_count??'미기록');field(inner,'검증 범위',list(r.stages).filter(s=>s.expectations_verified===true).length+' / '+list(r.stages).length+' 단계 기대결과 확인');
+ const same=c=>JSON.stringify([c.source?.tc_id,c.source?.procedure,c.source?.expected,c.source?.precondition]);
+ const prior=allRuns().filter(x=>x.run_id!==run.run_id&&new Date(x.started_at)<new Date(run.started_at)).sort((a,b)=>new Date(b.started_at)-new Date(a.started_at)).map(x=>({run:x,result:list(x.results).find(c=>c.source?.tc_id&&same(c)===same(r))})).find(x=>x.result);
+ field(inner,'이전 동일 TC',prior?formatTime(prior.run.started_at)+' · '+text(prior.result.status)+' → '+text(r.status)+' · '+text(prior.result.actual||prior.result.reason):'동일 사전조건·절차·기대결과의 이전 기록 없음');
  inner.append($('div','원문 절차 · 예상 / 실제','ex-mini-heading'));field(inner,'사전조건',r.source?.precondition);field(inner,'절차',r.source?.procedure);field(inner,'기대결과',r.source?.expected);
  inner.append($('div','단계별 검증 기록','ex-mini-heading'));const stages=list(r.stages);
  if(!stages.length)inner.append($('p','저장된 단계별 기록이 없습니다. 절차나 검증 결과를 추정하지 않습니다.','ex-note'));
@@ -96,8 +102,11 @@ function showDetail(run,r,index,focus=true){detailIndex=index;detailSignature=JS
  const provenance=$('div',undefined,'ex-provenance');provenance.append($('p',text(r.source?.sheet)+' · '+text(r.source?.row)+'행 / 실행 '+run.run_id),$('p','원본 버전 '+text(r.source?.version)), $('p','시작 '+formatTime(r.started_at)+' / 종료 '+formatTime(r.finished_at)));inner.append(provenance);detail.append(inner);
  for(const link of body.querySelectorAll('.ex-case-link')){const selectedRow=Number(link.dataset.index)===index;link.setAttribute('aria-expanded',String(selectedRow));link.closest('tr').classList.toggle('ex-selected',selectedRow);}if(focus){b.focus({preventScroll:true});if(matchMedia('(max-width:900px)').matches)detail.scrollIntoView({block:'start'});}}
 function render(){const run=currentRun(),c=metrics(run),total=list(run?.results).length,summary=runState(run),active=data.current?.state==='running';stop.disabled=!active;
+ let exportButton=document.getElementById('execution-export');if(!exportButton){exportButton=$('button','회차 Excel');exportButton.id='execution-export';topActions.append(exportButton);}exportButton.disabled=!run||!['finished','stopped'].includes(run.state);exportButton.onclick=()=>{if(run)location.href='/api/execution/results/'+encodeURIComponent(run.run_id)+'/export';};
  runTitle.textContent=run?text(run.filename||run.results[0]?.source?.filename||'실행 결과'):'아직 저장된 실행이 없습니다';runSource.textContent=run?method(run.method):'실제 기록을 기다리고 있습니다';runId.textContent=run?'실행 ID '+run.run_id:'';
  status.textContent=summary.label;status.className='ex-run-state ex-state-'+summary.kind;
+ const priorProject=projectFilter.value;projectFilter.replaceChildren();option(projectFilter,'','전체 프로젝트');for(const p of [...new Set(allRuns().map(r=>r.project_id||'__unassigned'))])option(projectFilter,p,p==='__unassigned'?'프로젝트 미지정':p);projectFilter.value=priorProject;
+ status.title=run?'파일 '+text(run.filename)+' · 원본 버전 '+text(run.source_version)+' · 실행 대상 '+total+'개 · 실제 입력 '+text(run.input_count)+'회':'';
  current.textContent=run?.state==='running'?'현재 TC: '+(run.current_tc||'준비 중')+' · 단계 '+text(run.current_step):run?'시작 '+formatTime(run.started_at)+' · 종료 '+formatTime(run.finished_at):'테스트를 실행하면 원문과 함께 결과가 여기에 표시됩니다.';
  if(active&&data.current.run_id!==run?.run_id)current.textContent+=' · 별도 실행 진행 중: '+text(data.current.current_tc||'준비 중');
  meta.replaceChildren();addMeta('앱 · 기기',run?.environment?.device||run?.environment?.reason);addMeta('선택 범위',run?total+'건':'미기록');addMeta('원본 버전',run?.source_version?run.source_version.slice(0,16):null);addMeta('업로드',run?(run.upload_id&&data.upload_id&&run.upload_id===data.upload_id?'현재 업로드':'이전 업로드 또는 버전 미기록'):null);

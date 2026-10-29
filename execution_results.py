@@ -28,7 +28,7 @@ def new_run(steps, metadata, method, environment=None, run_id=None):
         raise ValueError('Unknown execution source')
     return {'schema_version': 2, 'run_id': run_id or uuid.uuid4().hex, 'method': method,
             'source_version': metadata.get('file_hash', ''), 'upload_id': metadata.get('upload_id', ''),
-            'filename': metadata.get('filename', ''), 'started_at': now(), 'finished_at': None,
+            'filename': metadata.get('filename', ''), 'project_id': metadata.get('project_id', ''), 'started_at': now(), 'finished_at': None,
             'state': 'running', 'current_tc': None, 'current_step': None,
             'environment': copy.deepcopy(environment or {'device': None, 'app': None, 'reason': 'Not captured'}),
             'results': [{'index': i, 'source': source(s, metadata), 'status': 'not_run', 'error_kind': None,

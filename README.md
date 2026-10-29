@@ -455,3 +455,36 @@ TC를 선택하고 Run Test Case 또는 AI TC RUN으로 계획을 준비한 뒤,
 AI 모드는 선택 자료·실행 화면 분석에 대한 동의가 필요합니다. 결과는 원본 기대결과와
 분리해 저장하며 `실행결과 Excel`로 내보냅니다. 범위와 제한은
 [TC 실행 흐름](docs/tc-execution-workflow.md)을 확인하세요.
+# Approved Automation Library (5000)
+
+AI TC RUN prepares source-bound actions and expectation checkpoints. Review the
+plan, choose `승인·버전 저장`, select the saved version and choose `불러오기`, then
+approve execution. Loading does not operate the device. Each execution creates a
+new result ID; existing results and evidence are not rewritten.
+
+- Storage: `qa_results/automation_library/*.json`, immutable version + digest.
+- Appium: start `start_prepared_appium.ps1` separately (localhost port 4725), then
+  start the normal 5000 server. Requires Appium, UiAutomator2 and Python Appium
+  client already installed. `QA_PREPARED_APPIUM_URL` can override the local URL.
+- No app installation/reset is requested. Appium may provision its helper apps.
+- Re-upload the same workbook after restart. Source content, file hash, project,
+  device serial and foreground app/version must match the approved version.
+- Exact quoted text presence/absence compiles to deterministic checks. Other
+  visual/semantic expectations keep the existing AI verifier and require consent.
+  The version menu distinguishes AI-required from AI-free execution.
+- Saved input uses Appium exact text/accessibility targets. Ambiguous or missing
+  targets Block; arbitrary AI code, shell commands and guessed coordinates are
+  not executed. Semantic navigation may still require AI in AI-required versions.
+- Code export is a reviewable Python wrapper of the validated execution manifest,
+  not a standalone test runner. Actual execution is via the approved server
+  interpreter; importing uploaded Python is deliberately unsupported.
+- Native lifecycle special cases cannot yet be saved. Resource-ID authoring,
+  input/data setup, a repeat-count scheduler and automatic patch promotion are
+  outside this initial library. Repeated runs currently use load + approval.
+- `device_verified` means every TC passed in the latest retained run; it is not
+  proof for other data, screens or app builds. Failed/partial runs remain visible.
+- Tests: `python -m unittest tests.test_automation_library tests.test_testcase_reset`.
+  `tools/check_saved_automation.cjs` is an explicit live smoke helper, not part of
+  routine tests. Its workbook is specific to the observed TOEIC card screen.
+- Socket.IO 4.7.2 is served locally from `static/vendor/` (MIT license in the
+  distributed header), avoiding a mandatory runtime CDN connection.

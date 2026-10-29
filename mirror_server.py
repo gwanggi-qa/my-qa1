@@ -6068,6 +6068,7 @@ HTML = r"""
 
         <section class="tab-pane active" id="tab-test-case" aria-label="Test Case tab">
           <div class="upload-panel">
+            <input id="tc-project" maxlength="80" placeholder="프로젝트 ID (예: mind/toeic)" aria-label="프로젝트 ID">
             <input id="excel-file" type="file" accept=".xlsx,.xlsm" aria-label="Excel test case file">
             <button class="btn-upload" type="button" onclick="uploadTestCase()"><span class="ui-icon icon-upload" aria-hidden="true"></span>Upload</button>
             <button class="btn-secondary" id="btn-tc-reset" type="button" onclick="resetUploadedTestCase()"><span class="ui-icon icon-clear" aria-hidden="true"></span>업로드 TC 초기화</button>
@@ -6094,6 +6095,13 @@ HTML = r"""
               <button class="btn-run" type="button" id="tc-flow-start" disabled>계획 확인 후 실행</button>
               <button class="btn-secondary" type="button" id="tc-flow-stop" disabled>준비·실행 중단</button>
               <button class="btn-secondary" type="button" id="tc-flow-export" disabled>실행결과 Excel</button>
+              <button class="btn-secondary" type="button" id="tc-flow-save" disabled>✓ 승인·버전 저장</button>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+              <select id="tc-flow-library" aria-label="저장된 자동화 버전" style="min-width:0;flex:1"><option value="">저장 버전 선택</option></select>
+              <button type="button" class="btn-secondary" id="tc-flow-load">불러오기</button>
+              <button type="button" class="btn-secondary" id="tc-flow-code">코드 내보내기</button>
+              <button type="button" class="btn-secondary" id="tc-flow-refresh" title="저장 버전 새로고침">↻</button>
             </div>
           </section>
           <div class="test-resolution-state" id="test-resolution-state" hidden></div>
@@ -6305,7 +6313,7 @@ HTML = r"""
     </section>
   </div>
 
-  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="/static/vendor/socket.io-4.7.2.min.js"></script>
   <script>
     const socket = io('/mirror', window.QALocalAccess.socketOptions());
     socket.on('testcase_changed', async () => {
@@ -7101,6 +7109,7 @@ HTML = r"""
 
     async function postExcel(file, mapping = null, preview = false) {
       const form = new FormData();
+      form.append('project_id', document.getElementById('tc-project').value.trim());
       form.append('file', file);
       if (mapping) form.append('mapping', JSON.stringify(mapping));
       if (preview) form.append('preview', 'true');
@@ -8490,7 +8499,25 @@ def execution_results_api():
                     "upload_id": _test_metadata.get("upload_id"), "file_hash": _test_metadata.get("file_hash")})
 
 
-@app.route("/api/execution/sources")
+@app.get('/api/execution/results/<run_id>/export')
+def historical_result_export(run_id):
+    history, _ = execution_results.read_history(TEST_RUN_HISTORY_FILE)
+    current = _verified_run.snapshot() if _verified_run else None
+    run = next((r for r in ([current] if current else []) + history if r['run_id'] == run_id), None)
+    if not run:
+        return jsonify(error='실행 기록을 찾을 수 없습니다.'), 404
+    if run.get('state') not in ('finished', 'stopped'):
+        return jsonify(error='완료 또는 중단된 회차만 내보낼 수 있습니다.'), 409
+    import tc_format
+    book = tc_format.workbook(tc_format.step_row({**c['source'].get('original', {}), 'note': c.get('note') or c.get('actual') or c.get('reason', '')}, c['status']) for c in run['results'])
+    info = book.create_sheet('실행 정보')
+    for key in ('run_id', 'filename', 'source_version', 'started_at', 'finished_at', 'method'):
+        info.append([key, str(run.get(key, ''))])
+    payload = tc_format.append_execution_details(tc_format.save(book), run)
+    return send_file(io.BytesIO(payload), as_attachment=True, download_name='testcase-results-'+run_id+'.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+@app.route('/api/execution/sources')
 def execution_sources():
     if not local_access.client_allowed(request.remote_addr):
         return local_access.rejection("trusted_network_required")
@@ -8749,6 +8776,7 @@ def upload_testcase():
     source = testcase_source(steps)
     metadata = {
         "filename": filename,
+        "project_id": request.form.get('project_id', '').strip()[:80],
         "file_hash": hashlib.sha256(file_payload).hexdigest(),
         "source": source,
         "count": len(steps),

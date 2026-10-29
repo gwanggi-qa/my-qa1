@@ -14,6 +14,8 @@ import tc_format
 import tc_adaptive
 import tc_lifecycle
 import verified_execution
+import automation_library
+import prepared_appium
 from ai_request_errors import AIRequestError, ERRORS
 
 ACTION = ai_tc.obj({'procedure': {'type': 'integer'},
@@ -150,6 +152,30 @@ def standard_plan(step, index):
     return {'index':index,'actions':[] if reason else actions,'blocked_reason':reason}, checks
 
 
+def literal_checks(steps, plans):
+    """Compile only exact source assertions; never simplify a compound visual claim."""
+    result={}
+    for i,(step,plan) in enumerate(zip(steps,plans),1):
+        if any(a['action']=='navigate' for a in plan['actions']):
+            return None
+        values=[str(step.get('precondition') or ''),ai_tc.expected_text(step),*tc_adaptive.expectations(step)]
+        compiled={}
+        for value in values:
+            checks=[]
+            for clause in value.splitlines():
+                if not clause.strip():
+                    continue
+                match=re.fullmatch(r'["“\'](.+?)["”\']\s*(?:이|가|은|는)?\s*(표시된다|존재한다|표시되지 않는다)\.?',clause.strip())
+                if not match:
+                    return None
+                check={'source':clause,'selector':{'text':match[1]},'present':match[2]!='표시되지 않는다'}
+                verified_execution.validate_atomic_check(check)
+                checks.append(check)
+            compiled[value]=checks
+        result[i]=compiled
+    return result
+
+
 class Workflow:
     def __init__(self, host, steps, metadata, indices, ai_mode, template=None):
         self.host, self.steps, self.metadata = host, copy.deepcopy(steps), copy.deepcopy(metadata)
@@ -165,6 +191,11 @@ class Workflow:
         self.plans, self.standard_checks = [], {}
         self.ai_metrics = {'planner_calls':0,'responses':0,'usage':{}}
         self.ai_fallback = False
+        self.saved_version = None
+        self.appium = None
+        self.engine = 'adb'
+        self.bound_environment = None
+        self.offline_checks = None
         self.planning = {i:{'status':'pending','retry_count':0,'errors':[]} for i in range(1,len(steps)+1)}
         self.execution_phase='analyzing'
         self.provider_failure=None
@@ -183,6 +214,7 @@ class Workflow:
     def public(self):
         with self.lock:
             return {'id':self.id,'state':self.state,'message':self.message,'ai_mode':self.ai_mode,
+                    'saved_version':self.saved_version,'engine':self.engine,
                     'upload_id':self.metadata.get('upload_id'),
                     'plan_digest':self.digest,'file_hash':self.metadata.get('file_hash'),
                     'ai':copy.deepcopy(self.ai_metrics),'ai_fallback':self.ai_fallback,
@@ -370,6 +402,15 @@ class Workflow:
         self.guard()
         if not expected.strip():
             return '명시된 사전조건 없음', []
+        if self.offline_checks is not None:
+            checks=self.offline_checks.get(step['_workflow_index'],{}).get(expected)
+            if not checks:
+                raise self.host.BlockedStep('저장된 검사 조건에 없는 요구입니다. 재승인이 필요합니다.')
+            xml=self.appium.xml() if self.appium else self.host.dump_ui_xml()
+            misses=[c for c in checks if (verified_execution.ui_guard.select(xml,c['selector'],optional=True) is not None)!=c['present']]
+            if misses:
+                raise AssertionError('기대 문구 조건 불일치: '+'; '.join(c['source'] for c in misses))
+            return '저장된 원문 문구 조건 모두 확인', [self.evidence('Appium 문구 검증')]
         if not self.ai_mode or step['_workflow_index'] in self.standard_checks:
             checks=self.standard_checks[step['_workflow_index']][0 if precondition else 1]
             if not checks:
@@ -419,6 +460,8 @@ class Workflow:
     def navigate(self, step, goal, case, precondition=False):
         """Resolve a source goal against fresh screen candidates, never guessed coordinates."""
         m = self.host
+        if self.offline_checks is not None:
+            return self.check(step,goal,precondition)
         while True:
             self.guard()
             probe = copy.deepcopy(step)
@@ -500,6 +543,32 @@ class Workflow:
             if self.cancel.wait(action['wait_ms']/1000):
                 self.guard()
             return '원문 대기 완료'
+        if self.appium is not None:
+            with self.host._adb_input_lock:
+                self.guard()
+                label = selected.get('label', '') if selected else action['target']
+                if RISK.search(label):
+                    raise self.host.BlockedStep('별도 승인이 필요한 대상입니다.')
+                self.phase('Appium 실제 조작 중 · '+kind+' '+label, 'device_input')
+                try:
+                    if kind == 'tap':
+                        self.appium.tap(label)
+                    elif kind == 'swipe':
+                        self.appium.swipe(action['direction'])
+                    elif kind == 'back':
+                        root, _ = verified_execution.ui_guard.nodes(self.appium.xml())
+                        if tc_adaptive.back_confirmation_risk(root):
+                            raise ValueError('종료·저장 확인 화면에서는 뒤로가기를 수행하지 않습니다.')
+                        self.appium.back()
+                    else:
+                        raise ValueError('Unsupported Appium action')
+                except ValueError as exc:
+                    raise self.host.BlockedStep(str(exc)) from exc
+                step.setdefault('_input_events', []).append({'action':kind,'target':label,
+                    'status':'appium_accepted','at':records.now()})
+            if self.cancel.wait(.35):
+                self.guard()
+            return 'Appium 입력 전달 확인 · '+kind+': '+label
         candidate=selected
         if kind in {'tap','swipe'} and candidate is None:
             candidates,_=self.host.ai_test_screen_candidates()
@@ -574,6 +643,14 @@ class Workflow:
             if not m.check_device():
                 raise m.BlockedStep('연결되고 디버깅 허용된 기기가 없습니다.')
             self.data['environment']={'device':m.get_device_info(),'app':m.foreground_app_evidence()}
+            if self.bound_environment is not None:
+                if environment_key(m) != self.bound_environment:
+                    raise m.BlockedStep('저장 당시 앱/버전/기기가 다릅니다. 새 계획을 준비하고 재승인하세요.')
+            if self.engine == 'appium':
+                serial = self.data['environment']['device'].get('serial')
+                if not serial:
+                    raise m.BlockedStep('Appium 대상 기기 시리얼이 없습니다.')
+                self.appium = prepared_appium.AppiumSession(serial)
             self.guard()
             if getattr(self,'review_reset_token',None) is not None:
                 m.begin_redmine_review_run(self.data['run_id'],self.review_reset_token)
@@ -699,6 +776,8 @@ class Workflow:
                             case['evidence'].append({'url':evidence['screenshot_url'],'file':evidence.get('screenshot_file'),'findings':evidence.get('findings',[])})
                     case['ai_assisted']=bool(case['verification'])
                     case['note']=result_note(case,step)
+                    if self.saved_version:
+                        case['note']='저장 자동화 '+self.saved_version+' · Appium\n'+case['note'].replace('AI TC RUN','저장 TC 실행',1)
                     latest=next((e for e in reversed(case['evidence']) if e.get('url')), {})
                     extra={'verification':case['verification'],'ai_assisted':case['ai_assisted'],
                            'input_count':case.get('input_count',0),
@@ -714,6 +793,12 @@ class Workflow:
                 if case['status']=='running' or (status=='blocked' and case['status']=='not_run'):
                     records.finish_case(case,status=status,reason=str(exc),error_kind='cancelled' if status=='stopped' else 'environment')
         finally:
+            if self.appium is not None:
+                try:
+                    self.appium.close()
+                except Exception:
+                    self.data['session_cleanup_error'] = 'Appium 세션 종료 확인 필요'
+                self.appium = None
             with self.lock:
                 self.state='stopped' if self.cancel.is_set() or m._test_stop_event.is_set() else 'finished'
                 self.finished=True
@@ -729,11 +814,20 @@ class Workflow:
             counts=records.counts(self.data)
             self.phase(('실행 중단' if self.state=='stopped' else '실행 종료')+
                        ' · Pass {passed} / Fail {failed} / Block {blocked} / 미실행 {not_run}'.format(**counts)+
-                       ' · ADB 입력 '+str(self.data['input_count'])+'회','done')
+                       ' · '+('Appium' if self.engine=='appium' else 'ADB')+' 입력 '+str(self.data['input_count'])+'회','done')
             m.socketio.emit('test_run_finished',{'total':total,**counts,'mode':'ai' if self.ai_mode else 'standard',
                            'run_id':self.data['run_id'],'stopped':self.state=='stopped','ai_fallback':self.ai_fallback,
                            'workbook_export':{'workflow_id':self.id,'run_id':self.data['run_id'],'filename':'testcase-results.xlsx'},
                            'ai_assisted':sum(c.get('ai_assisted',False) and c['status']=='passed' for c in self.data['results'])},namespace='/mirror')
+
+
+def environment_key(host):
+    app = host.foreground_app_evidence()
+    device = host.get_device_info()
+    if not app.get('package') or not app.get('version') or not device.get('serial'):
+        raise ValueError('연결된 앱 버전과 기기 정보를 확인할 수 없습니다.')
+    return {'package':app['package'],'version':app['version'],'serial':device['serial'],
+            'android':device.get('android')}
 
 
 def register(app, host):
@@ -747,6 +841,97 @@ def register(app, host):
     @api.errorhandler(ValueError)
     def invalid(exc):
         return jsonify(error=str(exc)),409
+    def library():
+        return automation_library.Library(host().QA_RESULTS_DIR / 'automation_library')
+
+    @api.get('/api/tc-workflow/library')
+    def list_versions():
+        versions=library().listing()
+        history,_=records.read_history(host().QA_RESULTS_DIR/'test_run_history.jsonl',limit=500)
+        for item in versions:
+            runs=[r for r in history if r.get('automation_version')==item['version']]
+            latest=max(runs,key=lambda r:r.get('started_at','')) if runs else None
+            item['validation_state']='approved'
+            if latest:
+                item['last_run_id']=latest['run_id']
+                item['last_counts']=records.counts(latest)
+                item['validation_state']='device_verified' if latest.get('state')=='finished' and all(
+                    r['status']=='passed' for r in latest['results']) and latest['results'] else 'needs_review'
+        return jsonify(versions=versions)
+
+    @api.post('/api/tc-workflow/<job_id>/save')
+    def save_version(job_id):
+        m = host()
+        p = request.get_json() or {}
+        with m._automation_start_lock:
+            run = current(job_id)
+            run.guard()
+            if m._test_running or m._random_running or m._record_play_running or run.state != 'ready':
+                raise ValueError('준비 완료된 계획만 저장할 수 있습니다.')
+            if p.get('approved') is not True or p.get('plan_digest') != run.digest:
+                raise ValueError('계획과 검사 조건을 확인한 후 승인하세요.')
+            if not any(not plan['blocked_reason'] for plan in run.plans):
+                raise ValueError('실행 가능한 계획이 없습니다.')
+            for plan, step in zip(run.plans, run.steps):
+                if plan.get('native'):
+                    raise ValueError('앱 수명주기 특수 TC는 현재 저장 실행 범위에서 제외됩니다.')
+                validate_plan(plan, step)
+            with m._test_lock:
+                originals = copy.deepcopy([m._test_steps[i-1] for i in run.indices])
+            environment = environment_key(m)
+            compiled=literal_checks(run.steps,run.plans)
+            item = library().save({'name':str(p.get('name') or run.metadata.get('filename') or 'Automation')[:120],
+                'source_key':automation_library.source_key(originals,run.metadata),
+                'originals':originals,'steps':run.steps,'metadata':run.metadata,'indices':run.indices,
+                'plans':run.plans,'standard_checks':run.standard_checks,'ai_mode':run.ai_mode,
+                'offline_checks':compiled,'ai_required':run.ai_mode and compiled is None,
+                'engine':'appium','environment':environment})
+            return jsonify(version=item['version'], ai_required=item['ai_required']),201
+
+    @api.get('/api/tc-workflow/library/<version>/code')
+    def version_code(version):
+        return Response(automation_library.code_for(library().read(version)), mimetype='text/x-python',
+                        headers={'Content-Disposition':'attachment; filename="automation-'+version+'.py"'})
+
+    @api.post('/api/tc-workflow/library/<version>/load')
+    def load_version(version):
+        m = host()
+        p = request.get_json() or {}
+        with m._automation_start_lock:
+            if m._test_running or m._random_running or m._record_play_running:
+                raise ValueError('다른 실행이 진행 중입니다.')
+            item = library().read(version)
+            if item['ai_required'] and p.get('consent') is not True:
+                raise ValueError('이 버전은 실행 중 AI 화면 검사/복구를 사용합니다. AI 분석 동의가 필요합니다.')
+            with m._test_lock:
+                metadata = copy.deepcopy(m._test_metadata)
+                steps = copy.deepcopy(m._test_steps)
+            indices = item['indices']
+            if any(i < 1 or i > len(steps) for i in indices):
+                raise ValueError('저장 당시 TC 파일을 업로드하세요.')
+            originals = [steps[i-1] for i in indices]
+            if automation_library.source_key(originals, metadata) != item['source_key']:
+                raise ValueError('TC 파일/내용/프로젝트가 변경되었습니다. 새 계획이 필요합니다.')
+            if environment_key(m) != item['environment']:
+                raise ValueError('앱 버전 또는 기기가 변경되어 재검증이 필요합니다.')
+            run = Workflow(m, originals, metadata, indices, item['ai_mode'])
+            if run.steps != item['steps']:
+                raise ValueError('실행기 변환 기준이 변경되었습니다. 다시 준비하세요.')
+            run.plans = [validate_plan(plan, step) for plan,step in zip(item['plans'],run.steps)]
+            if len(run.plans) != len(run.steps):
+                raise ValueError('저장된 계획의 TC 개수가 다릅니다.')
+            run.standard_checks = {int(k):v for k,v in item['standard_checks'].items()}
+            run.offline_checks=literal_checks(run.steps,run.plans)
+            run.saved_version, run.engine, run.bound_environment = version, 'appium', item['environment']
+            run.digest = records.fingerprint({'metadata':run.metadata,'steps':run.steps,'plans':run.plans})
+            run.data.update(automation_version=version,automation_digest=item['digest'],engine='appium',
+                            plans=copy.deepcopy(run.plans),plan_digest=run.digest,
+                            verifier='literal-ui-text' if run.offline_checks is not None else 'ai-assisted-visual')
+            run.state, run.message = 'ready', '저장 버전 준비 완료 · Appium · 실행 전 승인 필요'
+            run.planning = {i:{'status':'ready','retry_count':0,'errors':[]} for i in range(1,len(run.steps)+1)}
+            service['current'] = run
+            m._test_stop_event.clear()
+            return jsonify(workflow=run.public())
     @api.post('/api/tc-workflow/prepare')
     def prepare():
         m=host()
@@ -835,6 +1020,7 @@ def register(app, host):
             {**c['source']['original'],'note':c.get('note','')},c['status']) for c in snapshot['results'])
         info=book.create_sheet('실행 정보')
         for row in [('실행 ID',snapshot['run_id']),('원본 파일',run.metadata.get('filename','')),
+                    ('자동화 버전',snapshot.get('automation_version','')),('실행 엔진',snapshot.get('engine','adb')),
                     ('파일 해시',run.metadata.get('file_hash','')),('시작 시각',str(snapshot.get('started_at',''))),
                     ('완료 시각',str(snapshot.get('finished_at',''))),
                     ('실행 대상',', '.join(c['source']['tc_id'] for c in snapshot['results'])),

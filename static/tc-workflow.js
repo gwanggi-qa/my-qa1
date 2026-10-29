@@ -17,6 +17,8 @@
     document.getElementById('btn-tc-reset').disabled=busy||['preparing','running'].includes(state);
     document.querySelectorAll('#tc-flow-steps [data-phase]').forEach(el=>{const active=el.dataset.phase===state;el.style.color=active?'#53d8c0':'';el.style.fontWeight=active?'700':'';el.setAttribute('aria-current',active?'step':'false');});
     const active=['preparing','running'].includes(state);
+    $('save').disabled=busy||!canStart();
+    ['load','library','refresh','code'].forEach(id=>$(id).disabled=busy||active);
     if(['finished','stopped'].includes(state)&&flow?.results&&window.setWorkbookExport){
       window.setWorkbookExport({workflow_id:flow.id,run_id:flow.results.run_id,filename:'testcase-results-'+flow.results.run_id+'.xlsx'});
     }
@@ -46,6 +48,12 @@
     catch(e){message(e.message);}finally{busy=false;$('start').disabled=!canStart();$('stop').disabled=!['preparing','ready','running'].includes(flow?.state);$('consent').disabled=['preparing','running'].includes(flow?.state);document.querySelectorAll('.tc-flow-selection').forEach(e=>e.disabled=['preparing','running'].includes(flow?.state));}
   }};
   $('start').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{const data=await api(flow.id+'/start',{plan_digest:flow.plan_digest,approved:true});flow=data.workflow;render();poll();}catch(e){error=e.message;}finally{busy=false;render();if(error)message(error);}};
+  async function refreshLibrary(){const data=await api('library');const previous=$('library').value;$('library').replaceChildren(new Option('저장 버전 선택',''));for(const item of data.versions){const states={approved:'승인·미검증',device_verified:'실기기 검증 완료',needs_review:'결과 검토 필요'};$('library').add(new Option(`${item.name} · ${item.version.slice(0,8)} · ${states[item.validation_state]} · ${item.ai_required?'AI 검사·복구 사용':'AI 없이 반복'} · ${item.approved_at}`,item.version));}if([...$('library').options].some(o=>o.value===previous))$('library').value=previous;}
+  $('refresh').onclick=()=>refreshLibrary().catch(e=>message(e.message));
+  $('save').onclick=async()=>{if(busy||!canStart())return;if(!confirm('표시된 절차와 기대결과 검사 조건을 승인하여 새 버전으로 저장할까요? 저장만으로 실기기 검증 완료가 되지는 않습니다.'))return;busy=true;render();let msg;try{const data=await api(flow.id+'/save',{approved:true,plan_digest:flow.plan_digest});await refreshLibrary();$('library').value=data.version;msg='승인 버전 저장 완료 · 불러온 뒤 실기기 시험 실행하세요.';}catch(e){msg=e.message;}finally{busy=false;render();message(msg);}};
+  $('load').onclick=async()=>{if(busy||!$('library').value)return;busy=true;render();let msg;try{const data=await api('library/'+$('library').value+'/load',{consent:$('consent').checked});flow=data.workflow;$('plan').open=true;render();msg=flow.message;}catch(e){msg=e.message;}finally{busy=false;render();message(msg);}};
+  $('code').onclick=async()=>{if(!$('library').value)return;try{const r=await fetch('/api/tc-workflow/library/'+$('library').value+'/code');if(!r.ok)throw Error((await r.json()).error);const u=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=u;a.download='automation-'+$('library').value+'.py';a.click();setTimeout(()=>URL.revokeObjectURL(u),10000);}catch(e){message(e.message);}};
+  refreshLibrary().catch(e=>message(e.message));
   $('stop').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{await api(flow.id+'/stop',{});message('중단 처리 중');poll();}catch(e){error=e.message;}finally{busy=false;render();message(error||'중단 처리 중');}};
   $('export').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{const res=await fetch('/api/tc-workflow/'+flow.id+'/export');if(!res.ok)throw Error((await res.json()).error);const url=URL.createObjectURL(await res.blob());const a=document.createElement('a');a.href=url;a.download='testcase-results-'+flow.results.run_id+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}catch(e){error=e.message;}finally{busy=false;render();if(error)message(error);}};
   window.addEventListener('pagehide',()=>{++version;clearTimeout(timer);});
