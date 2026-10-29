@@ -13,15 +13,29 @@ from or returned to browsers. Figma MCP in Codex is not the web server credentia
 - POST /builds/<sha>/draft-context: {reference_ids, scope, count, include_images}.
   Return redacted bounded context, context_hash, provider, warnings and image IDs.
 - POST /builds/<sha>/drafts: same fields plus context_hash and consent:true.
-  Snapshot context and queue one AI request; 202, global busy 409, no fallback.
+  Snapshot context and queue generation; 202, global busy 409, no fallback.
 - GET /builds/<sha>/drafts and /drafts/<id>: list/detail persistent batches.
 - POST /builds/<sha>/drafts/<id>/stop: {}; stop generation, discard late results.
 - PATCH /builds/<sha>/drafts/<id>/cases/<case_id>: editable fields, review status,
   revision. Optimistic concurrency 409; AI never sets approval or execution state.
-- GET /builds/<sha>/drafts/<id>/export: approved cases only as XLSX. No direct run.
+- GET /builds/<sha>/drafts/<id>/export: all saved non-rejected cases as XLSX. No direct run.
+- POST /builds/<sha>/drafts/<id>/resume: {consent:true}; explicit resume of unfinished
+  coverage jobs using the saved provider/model, text and image snapshot.
 - GET /api/app-analysis/testcase-template: blank standard TestCase workbook.
 
-Limits: 1-20 draft cases, 1-8 explicitly selected references, max 4 images, bounded
+The UI uses count:0 for coverage generation, with no total TC cap. A first AI call
+creates a finite evidence-linked coverage plan; each unit generates up to 10 TCs.
+Each completed unit and its cases commit together to SQLite draft_checkpoints and
+tc_drafts. Exact duplicate scenarios are excluded. Empty/duplicate-only units are
+marked needs_material_or_duplicate, not verified. Export includes a Coverage sheet.
+There is no whole-job deadline; each individual AI request retains its 600-second
+timeout. Stop discards the in-flight response, not previously committed units.
+Explicit resume continues from the saved cursor. No automatic error retries or
+paid-provider fallback occur. Progress reports completed/total units and generated
+cases; ETA uses this job's completed-unit durations, not invented initial estimates.
+Legacy count:1-20 jobs remain supported and readable, but are not resumable.
+
+Reference limits remain: 1-8 explicitly selected references, max 4 images, bounded
 source excerpts with omission warnings. Preview is mandatory; the hash covers
 provider identity, source excerpts, image digests, scope and requested count.
 Known credentials/emails are redacted in text. Images need explicit inclusion and
@@ -29,7 +43,8 @@ human privacy review; automated redaction is not complete privacy protection.
 
 SQLite schema 3 adds generation jobs with immutable source snapshots, original
 model response/usage, editable case copies and revision. On restart unfinished
-jobs are interrupted, never resumed. Review approval is not a test Pass and is
+jobs are interrupted, never automatically resumed. Coverage jobs can be manually
+resumed; old single-request jobs must be regenerated. Review approval is not a test Pass and is
 not an execution approval. No existing TC state is overwritten.
 
 Expected-result authority: requirements/design establish intended behavior;

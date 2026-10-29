@@ -272,6 +272,7 @@ class AnalysisStore:
                         raise AnalysisError('Analysis database schema is newer than this server.', 503)
                     db.executescript('''
                         PRAGMA journal_mode=WAL;
+                        CREATE TABLE IF NOT EXISTS archived_builds (sha256 TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
                         CREATE TABLE IF NOT EXISTS builds (
                             sha256 TEXT PRIMARY KEY, filename TEXT NOT NULL,
                             size_bytes INTEGER NOT NULL, created_at TEXT NOT NULL);
@@ -353,6 +354,7 @@ class AnalysisStore:
                     raise AnalysisError('Stored APK integrity check failed.', 409)
                 if not found:
                     db.execute('INSERT INTO builds VALUES (?,?,?,?)', (key, name[:160], size, now()))
+                db.execute('DELETE FROM archived_builds WHERE sha256=?', (key,))
             return self.get(key), bool(found)
         finally:
             if temp is not None:
@@ -374,7 +376,7 @@ class AnalysisStore:
 
     def list(self):
         with self.connect() as db:
-            rows = db.execute('SELECT * FROM builds ORDER BY created_at DESC LIMIT 100').fetchall()
+            rows = db.execute('SELECT * FROM builds WHERE sha256 NOT IN (SELECT sha256 FROM archived_builds) ORDER BY created_at DESC LIMIT 100').fetchall()
         return [dict(row) for row in rows]
 
 
@@ -481,6 +483,30 @@ def register(app, access, root=None, ai_runner=None, ai_status=None):
     @api.get('/api/app-analysis/builds/<sha>')
     def build(sha):
         return jsonify(build=service.store.get(sha))
+
+    @api.delete('/api/app-analysis/builds/<sha>')
+    def delete_build(sha):
+        if request.get_json() != {'confirm': True}:
+            raise AnalysisError('빌드 삭제 확인이 필요합니다.')
+        drafts = app.extensions['tc_drafts']
+        with service.lock, drafts.lock:
+            service.store.get(sha)
+            apk_path = service.store.path(sha)
+            if apk_path.resolve().parent != (service.store.root / 'builds').resolve():
+                raise AnalysisError('Invalid APK storage path.', 409)
+            with service.store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if (db.execute("SELECT 1 FROM jobs WHERE build_sha256=? AND status='running'", (sha,)).fetchone()
+                        or db.execute("SELECT 1 FROM tc_drafts WHERE build_sha256=? AND status='running'", (sha,)).fetchone()):
+                    raise AnalysisError('분석 또는 TC 생성 중인 빌드는 중단·완료 후 삭제하세요.', 409)
+                db.execute('DELETE FROM draft_checkpoints WHERE job_id IN (SELECT id FROM tc_drafts WHERE build_sha256=?)', (sha,))
+                db.execute('DELETE FROM tc_drafts WHERE build_sha256=?', (sha,))
+                db.execute('DELETE FROM reference_materials WHERE build_sha256=?', (sha,))
+                db.execute('DELETE FROM jobs WHERE build_sha256=?', (sha,))
+                db.execute('DELETE FROM archived_builds WHERE sha256=?', (sha,))
+                db.execute('DELETE FROM builds WHERE sha256=?', (sha,))
+                apk_path.unlink(missing_ok=True)
+        return jsonify(deleted=True, execution_results_preserved=True)
 
     @api.post('/api/app-analysis/builds/<sha>/analyze')
     def analyze(sha):

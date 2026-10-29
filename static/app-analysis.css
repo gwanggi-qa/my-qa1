@@ -1,3 +1,7 @@
+#build-delete{display:block;width:100%;margin-top:12px;background:#101216;color:#fff;min-height:40px}
+#build-delete:disabled{opacity:1;border-color:#30343c;cursor:default}
+#build-delete:not(:disabled){border-color:#89929e}
+#build-delete:hover:not(:disabled){background:#202228}
 :root{color-scheme:dark;font-family:"Segoe UI","Malgun Gothic",sans-serif;color:#e9edf1;background:#16181c;font-size:14px;letter-spacing:0}
 *{box-sizing:border-box}body{margin:0}header{display:flex;gap:28px;align-items:center;min-height:62px;padding:12px 24px;border-bottom:1px solid #393c43;background:#202228;flex-wrap:wrap}
 a{color:#b7cfed;text-decoration:none}.brand{font-weight:700;font-size:18px;color:#fff}nav{display:flex;gap:24px}nav a[aria-current]{color:#76ddc3;border-bottom:2px solid #76ddc3;padding:12px 0}.scope{margin-left:auto;color:#a7b0bc;font-size:12px}

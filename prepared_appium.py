@@ -51,6 +51,24 @@ class AppiumSession:
             return
         raise ValueError('Appium target not found: ' + target)
 
+    def tap_icon(self, candidate):
+        from appium.webdriver.common.appiumby import AppiumBy
+        bounds = candidate.get('bounds')
+        matches = [n for n in ET.fromstring(self.xml()).iter('node')
+                   if n.get('bounds') == bounds and n.get('clickable') == 'true'
+                   and n.get('enabled') != 'false'
+                   and n.get('class', '') == candidate.get('class', '')
+                   and n.get('resource-id', '') == candidate.get('resource_id', '')]
+        if len(matches) != 1:
+            raise ValueError('Icon changed before Appium input')
+        # Bounds originate from the current XML, never from generated coordinates.
+        if not __import__('re').fullmatch(r'\[\d+,\d+\]\[\d+,\d+\]', bounds or ''):
+            raise ValueError('Invalid icon bounds')
+        elements = self.driver.find_elements(AppiumBy.XPATH, '//*[@bounds="' + bounds + '" and @clickable="true"]')
+        if len(elements) != 1 or not elements[0].is_displayed() or not elements[0].is_enabled():
+            raise ValueError('Icon is no longer uniquely actionable')
+        elements[0].click()
+
     def back(self):
         self.driver.back()
 

@@ -17,7 +17,7 @@ STATUS_CODES = {'passed': 'PASS', 'failed': 'FAIL', 'blocked': 'BLOCK',
 
 
 def draft_row(case):
-    notes = '검토 승인된 AI 초안 · 미실행\n' + '\n'.join(case['assumptions'])
+    notes = ('검토 승인된 AI 초안' if case.get('review_status') == 'approved' else 'AI 생성 TC · 미검토') + ' · 미실행\n' + '\n'.join(case['assumptions'])
     notes += '\n시나리오: ' + case['category'] + '\n근거: ' + ', '.join(case['source_ids'])
     return [case['id'], case['title'], case['priority'], *(case.get('depth'+str(i), '') for i in range(1,4)),
             case.get('test_type', ''), case['objective'], case['preconditions'],

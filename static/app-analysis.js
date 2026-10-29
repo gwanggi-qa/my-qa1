@@ -5,6 +5,8 @@
   const names = {running:'분석 중',completed:'정적 분석 완료',failed:'분석 실패',stopped:'중단됨',interrupted:'재시작으로 중단'};
   let selected='', build=null, ready=false, tab='components', timer=null, requestId=0, busy=false;
   let referenceBuild='',reference=null,referenceBusy=false,referenceSerial=0,imageUrl='';
+  let deleteSelection='';
+  $('build-delete').onclick=async()=>{if(!selected||busy||!confirm('이 빌드의 APK·분석 이력·참고자료·생성 TC를 영구 삭제할까요? 실행 결과와 증거는 보존합니다. 재등록해도 이전 자료는 복원되지 않습니다.'))return;busy=true;$('build-delete').disabled=true;try{await api('builds/'+selected,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});location.reload();}catch(e){message(e.message,true);busy=false;$('build-delete').disabled=false;}};
   const kindNames={requirements:'기획서',design:'디자인',testcase:'기존 TC'};
   const referenceStates={ready:'미리보기 준비됨',partial:'부분 추출 · 검토 필요',visual_only:'이미지 · 텍스트 미추출'};
   const warningNames={
@@ -19,7 +21,7 @@
   };
   function message(text,error=false){$('message').textContent=text;$('message').classList.toggle('error',error);}
   async function api(path,options){const r=await fetch('/api/app-analysis/'+path,options);const data=await r.json();if(!r.ok)throw Error(data.error||'요청 실패');return data;}
-  function controls(){const running=build?.job?.status==='running';$('analyze').disabled=!build||!ready||running||busy;$('stop').disabled=!running||busy;$('upload').disabled=busy;referenceControls();}
+  function controls(){const running=build?.job?.status==='running';$('build-delete').disabled=!selected||deleteSelection!==selected||busy||running;$('analyze').disabled=!build||!ready||running||busy;$('stop').disabled=!running||busy;$('upload').disabled=busy;referenceControls();}
   function referenceControls(){for(const id of ['reference-upload','reference-file','reference-kind','reference-source'])$(id).disabled=!selected||referenceBusy;$('reference-delete').disabled=!reference||referenceBusy;}
   function referenceMessage(text,error=false){$('reference-message').textContent=text;$('reference-message').classList.toggle('error',error);}
   function clearReference(){++referenceSerial;reference=null;if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl='';$('reference-name').textContent='선택된 자료 없음';$('reference-meta').replaceChildren();$('reference-content').replaceChildren();$('reference-warning').textContent='';$('reference-unit-label').hidden=true;referenceControls();}
@@ -81,6 +83,7 @@
     inventory();controls();
   }
   async function select(sha){
+    $('build-delete').disabled=busy||deleteSelection!==sha;
     if(referenceBuild!==sha){referenceBuild=sha;clearReference();$('reference-list').replaceChildren();$('reference-count').textContent='0개';$('reference-file').value='';$('reference-source').value='';referenceMessage('자료 등록: AI 미사용');}
     selected=sha;const serial=++requestId;clearTimeout(timer);
     window.dispatchEvent(new CustomEvent('qa-build-selected',{detail:{sha}}));
@@ -101,7 +104,7 @@
       const e=node('span',''),dot=node('i','');dot.className='dot'+(ok?' ready':'');e.append(dot,document.createTextNode(name+': '+(value||'미확인')));$('environment').append(e);
     }
     $('build-list').replaceChildren();$('build-count').textContent=data.builds.length;
-    for(const b of data.builds){const button=node('button','');button.type='button';button.className='build';button.dataset.sha=b.sha256;button.append(node('strong',b.filename),node('small',b.sha256.slice(0,12)+' · '+(b.size_bytes/1024/1024).toFixed(2)+' MB'));button.onclick=()=>{message('');select(b.sha256);};$('build-list').append(button);}
+    for(const b of data.builds){const button=node('button','');button.type='button';button.className='build';button.dataset.sha=b.sha256;button.append(node('strong',b.filename),node('small',b.sha256.slice(0,12)+' · '+(b.size_bytes/1024/1024).toFixed(2)+' MB'));button.onclick=()=>{deleteSelection=b.sha256;message('');select(b.sha256);};$('build-list').append(button);}
     if(!data.builds.length)$('build-list').append(node('p','등록된 APK 없음'));
     if(data.builds.length)await select(data.builds.some(b=>b.sha256===selected)?selected:data.builds[0].sha256);else controls();
   }

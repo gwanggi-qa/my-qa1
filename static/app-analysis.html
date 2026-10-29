@@ -30,6 +30,7 @@
         </form>
         <div class="list-heading"><h2>등록된 빌드</h2><span id="build-count">0</span></div>
         <div id="build-list" aria-label="빌드 선택"></div>
+        <button id="build-delete" type="button" disabled>빌드 목록에서 삭제</button>
       </aside>
       <section class="detail" aria-label="분석 상세">
         <div class="detail-heading"><h2 id="build-name">선택된 빌드 없음</h2><span id="job-status" class="badge">대기</span></div>
@@ -68,19 +69,19 @@
           <div id="draft-sources" aria-label="생성에 사용할 자료"></div>
           <form id="draft-form">
             <label>생성 범위<input id="draft-scope" maxlength="500" placeholder="예: 학습 관리 화면의 LC·RC 표시와 탭 전환" required></label>
-            <label>최대 TC 수<input id="draft-count" type="number" min="1" max="20" value="10" required></label>
+            <input id="draft-count" type="hidden" value="0">
             <label class="check"><input id="draft-images" type="checkbox">선택 자료의 이미지 포함 (최대 4개)</label>
             <button id="draft-preview" type="submit" disabled>AI 입력 미리보기</button>
           </form>
           <details id="draft-input" hidden><summary>AI 전송 내용</summary><div id="draft-input-images"></div><pre id="draft-context"></pre></details>
           <label class="check"><input id="draft-consent" type="checkbox" disabled>선택 자료·이미지의 민감정보를 확인했으며, 표시된 AI provider로 전송하고 사용량이 발생하는 것에 동의합니다.</label>
-          <div class="actions"><button id="draft-generate" type="button" disabled>AI TC 초안 생성</button><button id="draft-stop" type="button" disabled>생성 중단</button></div>
+          <div class="actions"><button id="draft-generate" type="button" disabled>TC 생성</button><button id="draft-stop" type="button" disabled>생성 중단</button><button id="draft-resume" type="button" disabled>미완료분 재개</button></div>
           <p id="draft-message" class="reference-status" role="status" aria-live="polite">미실행 · 초안 검토 대기</p>
           <p id="draft-clock" class="reference-status" aria-live="off" hidden></p>
           <label>생성 이력<select id="draft-history"><option value="">생성 이력 없음</option></select></label>
           <div id="draft-review" hidden>
             <p id="draft-summary"></p><p id="draft-questions" class="notice"></p>
-            <div class="actions"><button id="draft-export" type="button" disabled>승인 TC Excel 내보내기</button></div>
+            <div class="actions"><button id="draft-export" type="button" disabled>생성된 TC Excel 내보내기</button></div>
             <label>검토할 TC<select id="draft-case"></select></label>
             <form id="draft-case-form">
               <label>제목<input id="case-title" maxlength="2000" required></label>

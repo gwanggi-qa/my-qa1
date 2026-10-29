@@ -4,7 +4,7 @@
   const node=(tag,text)=>{const el=document.createElement(tag);el.textContent=text;return el;};
   const fields=['title','objective','preconditions','steps','expected_results','priority','depth1','depth2','depth3','test_type','category','source_ids','assumptions'];
   const states={running:'생성 중',completed:'초안 생성 완료 · 미실행',failed:'생성 실패',stopped:'생성 중단',interrupted:'서버 재시작으로 중단'};
-  const reviews={draft:'검토 대기',approved:'검토 승인',rejected:'제외'};
+  const reviews={draft:'생성 완료·미검토',approved:'검토 승인',rejected:'제외'};
   let sha='',epoch=0,prepared=null,batch=null,caseId='',busy=false,figmaBusy=false,timer=null,dirty=false;
   let integrations={figma:{configured:false},ai:{configured:false}},imageUrls=[],sourceKey='';
   let clock=null,elapsedAt=0,elapsedBase=0,stoppingId='',pollDelayed=false,loadVersion=0;
@@ -13,7 +13,8 @@
   function clearClock(){clearInterval(clock);clock=null;$('draft-clock').hidden=true;}
   function tick(){if(!batch)return;const running=batch.status==='running';
     const elapsed=elapsedBase+(running?(performance.now()-elapsedAt)/1000:0);
-    $('draft-clock').hidden=false;$('draft-clock').textContent=(running?'경과 ':'총 소요 ')+duration(elapsed)+(running&&batch.timeout_seconds?' / 제한 '+duration(batch.timeout_seconds):'');}
+    const estimate=batch.progress?.remaining_seconds;
+    $('draft-clock').hidden=false;$('draft-clock').textContent=(running?'경과 ':'총 소요 ')+duration(elapsed)+(running?(batch.progress?(Number.isFinite(estimate)?' · 예상 남은 시간 약 '+duration(estimate)+' (추정)':' · 예상 시간 계산 중'):(batch.timeout_seconds?' / 요청 제한 '+duration(batch.timeout_seconds):'')):'');}
   function syncClock(){clearClock();if(!batch)return;
     elapsedBase=Number.isFinite(batch.elapsed_seconds)?batch.elapsed_seconds:Math.max(0,((batch.finished_at?Date.parse(batch.finished_at):Date.now())-Date.parse(batch.created_at))/1000);
     if(!Number.isFinite(elapsedBase))return;elapsedAt=performance.now();tick();if(batch.status==='running')clock=setInterval(tick,1000);}
@@ -21,6 +22,7 @@
     let label=running&&(batch.stopping||stoppingId===batch.id)?'중단 처리 중':(states[batch.status]||batch.status);
     if(batch.status==='failed')label+=' ['+(errors[batch.error_code]||'원인 미분류')+']';
     if(batch.error)label+=' · '+batch.error;
+    if(batch.progress){const p=batch.progress;label+=' · '+(p.total===null?'검증 범위 분석 중':p.completed+'/'+p.total+'묶음')+' · '+p.generated+'개 저장';}
     label+=running?' · AI 응답 대기':' · AI 요청 '+(metrics.planner_calls||0)+'회';
     if(!running)label+=metrics.usage&&Object.keys(metrics.usage).length?' · 토큰 '+JSON.stringify(metrics.usage):' · 사용량 확인 불가';
     if(pollDelayed)label+=' · 상태 확인 지연';message(label,batch.status==='failed'||pollDelayed);}
@@ -33,8 +35,9 @@
     for(const key of fields)$('case-'+key).disabled=busy;
     $('case-review-status').disabled=busy;
     $('draft-preview').disabled=!sha||busy||running;$('draft-generate').disabled=!prepared||!$('draft-consent').checked||!integrations.ai.configured||busy||running;
-    $('draft-stop').disabled=!running||busy||batch?.stopping||stoppingId===batch?.id;$('draft-export').disabled=!batch?.cases?.some(c=>c.review_status==='approved')||busy;
-    $('case-save').disabled=!caseId||busy;$('draft-history').disabled=busy||running;}
+    $('draft-stop').disabled=!running||busy||batch?.stopping||stoppingId===batch?.id;$('draft-export').disabled=!batch?.cases?.some(c=>c.review_status!=='rejected')||busy;
+    $('draft-resume').disabled=!batch?.progress?.resumable||busy;
+    $('case-save').disabled=!caseId||busy||batch?.status!=='completed';$('draft-history').disabled=busy||running;}
   function invalidate(){prepared=null;$('draft-consent').checked=false;$('draft-consent').disabled=true;$('draft-input').hidden=true;imageUrls.forEach(URL.revokeObjectURL);imageUrls=[];$('draft-input-images').replaceChildren();controls();}
   function selection(){return {reference_ids:[...document.querySelectorAll('#draft-sources input:checked')].map(e=>e.value),scope:$('draft-scope').value,count:Number($('draft-count').value),include_images:$('draft-images').checked};}
   async function connection(){try{integrations=await api('integrations');$('figma-status').textContent=integrations.figma.configured?'Figma: 서버 인증 설정됨 · 파일 권한은 가져올 때 확인':'Figma: FIGMA_ACCESS_TOKEN 설정 필요 (file_content:read)';$('draft-provider').textContent='AI: '+(integrations.ai.provider||'미설정')+' / '+(integrations.ai.model||'-')+(integrations.ai.configured?'':' · 연결 필요');controls();}catch(e){message(e.message,true);}}
@@ -43,7 +46,7 @@
     for(const key of fields)$('case-'+key).value=Array.isArray(c[key])?c[key].join(key==='source_ids'?', ':'\n'):(c[key]||'');
     $('case-review-status').value=c.review_status;
     $('case-evidence').textContent=batch.context.evidence.filter(e=>c.source_ids.includes(e.id)).map(e=>e.id+' · '+e.locator+'\n'+e.text).join('\n\n');dirty=false;controls();}
-  function renderBatch(){const running=batch?.status==='running';$('draft-review').hidden=batch?.status!=='completed';
+  function renderBatch(){const running=batch?.status==='running';$('draft-review').hidden=!batch?.cases?.length;
     syncClock();if(batch){batchMessage();
       $('draft-summary').textContent=batch.original?.summary||'';$('draft-questions').textContent=(batch.original?.questions||[]).join('\n');$('draft-original').textContent=JSON.stringify(batch.original,null,2);if(!running)caseOptions();}
     controls();}
@@ -67,6 +70,7 @@
     }catch(err){invalidate();message(err.message,true);}finally{busy=false;controls();}};
   $('draft-generate').onclick=async()=>{if(!prepared||!$('draft-consent').checked||busy)return;const current=sha,serial=epoch;busy=true;controls();try{const data=await api('builds/'+current+'/drafts',post({...prepared,consent:true}));if(serial!==epoch)return;invalidate();batch=data.draft;await history(batch.id);}catch(err){message(err.message,true);}finally{busy=false;controls();}};
   $('draft-stop').onclick=async()=>{if(!batch||busy)return;const id=batch.id,current=sha,serial=epoch;busy=true;stoppingId=id;batchMessage();controls();try{await api('builds/'+current+'/drafts/'+id+'/stop',post({}));if(serial===epoch)await loadBatch(id);}catch(err){if(serial===epoch){stoppingId='';message('중단 요청 실패 · '+err.message,true);}}finally{busy=false;controls();}};
+  $('draft-resume').onclick=async()=>{if(!batch||busy||!confirm('저장된 참고자료로 미완료 묶음의 AI 생성을 재개할까요?'))return;const id=batch.id,current=sha,serial=epoch;busy=true;controls();try{await api('builds/'+current+'/drafts/'+id+'/resume',post({consent:true}));if(serial===epoch)await loadBatch(id);}catch(err){message(err.message,true);}finally{busy=false;controls();}};
   $('draft-history').onchange=()=>{if(dirty&&!confirm('저장하지 않은 검토 내용을 버릴까요?')){$('draft-history').value=batch.id;return;}dirty=false;caseId='';loadBatch($('draft-history').value);};
   $('draft-case').onchange=()=>{if(dirty&&!confirm('저장하지 않은 검토 내용을 버릴까요?')){$('draft-case').value=caseId;return;}caseId=$('draft-case').value;renderCase();};
   for(const key of fields)$('case-'+key).oninput=()=>{dirty=true;$('case-review-status').value='draft';};

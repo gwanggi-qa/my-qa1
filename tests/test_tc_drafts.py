@@ -62,8 +62,7 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(batch['timeout_seconds'], 600)
         self.assertGreaterEqual(batch['metrics']['elapsed_seconds'], 0)
         self.assertIsNone(batch['error_code'])
-        with self.assertRaises(a.AnalysisError):
-            self.service.export(self.sha, batch['id'])
+        self.assertTrue(self.service.export(self.sha, batch['id']))
         case = batch['cases'][0]
         payload = {k: case[k] for k in d.FIELDS}
         payload.update(review_status='approved', revision=0, title='=HYPERLINK("bad")')
@@ -336,7 +335,7 @@ class DraftApiTests(unittest.TestCase):
         job = res.json['draft']['id']
         self.assertEqual(self.call('/drafts/' + job).json['draft']['status'], 'completed')
         self.assertEqual(len(self.call('/drafts').json['drafts']), 1)
-        self.assertEqual(self.call('/drafts/'+job+'/export').status_code, 409)
+        self.assertEqual(self.call('/drafts/'+job+'/export').status_code, 200)
         self.assertEqual(self.call('/drafts/unknown').status_code, 404)
 
     def test_origin_token_and_extra_payload_rejected(self):

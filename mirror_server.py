@@ -3542,8 +3542,8 @@ def apply_ai_test_hint(step, hint):
     return enriched
 
 
-def ai_test_screen_candidates():
-    xml = dump_ui_xml()
+def ai_test_screen_candidates(xml=None):
+    xml = dump_ui_xml() if xml is None else xml
     candidates = []
     seen = set()
     if xml:

@@ -477,7 +477,8 @@ class Workflow:
                 step['_workflow_verifications'] = probe.get('_workflow_verifications', [])
             if step.get('_supplements', 0) >= 5:
                 raise m.BlockedStep('원문: '+goal+' / 부족한 증거: 목표 화면 확인 실패 (보완 조작 5회 제한). '+observation)
-            candidates, _ = m.ai_test_screen_candidates()
+            candidates, _ = (m.ai_test_screen_candidates(xml=self.appium.xml())
+                             if self.appium else m.ai_test_screen_candidates())
             candidates = [c for c in candidates if m.ai_candidate_is_safe(c)
                           and c.get('action') in {'tap','swipe'} and not RISK.search(c.get('label',''))]
             image = m.capture_screen_png()
@@ -552,7 +553,10 @@ class Workflow:
                 self.phase('Appium 실제 조작 중 · '+kind+' '+label, 'device_input')
                 try:
                     if kind == 'tap':
-                        self.appium.tap(label)
+                        if selected and selected.get('source') == 'ui-icon':
+                            self.appium.tap_icon(selected)
+                        else:
+                            self.appium.tap(label)
                     elif kind == 'swipe':
                         self.appium.swipe(action['direction'])
                     elif kind == 'back':
@@ -672,7 +676,9 @@ class Workflow:
                         text = tc_lifecycle.execute(self, step, case, plan['native'])
                         records.finish_case(case, reason=text)
                         continue
-                    version=re.search(r'Android\s+(\d+)(?!\d)',str(step.get('precondition') or ''),re.I)
+                    scope=self.data.get('approved_scope') or {}
+                    precondition=scope.get('preconditions',{}).get(str(step['_workflow_index']),str(step.get('precondition') or ''))
+                    version=re.search(r'Android\s+(\d+)(?!\d)',precondition,re.I)
                     actual=str((self.data['environment'].get('device') or {}).get('android') or '').split('.')[0]
                     if version and version[1]!=actual:
                         raise m.BlockedStep('사전조건 Android '+version[1]+' / 연결 기기 Android '+(actual or '확인 불가')+' 불일치')
@@ -682,9 +688,9 @@ class Workflow:
                     case['stages'].append(stage)
                     try:
                         if self.ai_mode and step['_source_bound']:
-                            text,evidence=self.navigate(step,str(step.get('precondition') or ''),case,True)
+                            text,evidence=self.navigate(step,precondition,case,True)
                         else:
-                            text,evidence=self.check(step,str(step.get('precondition') or ''),True)
+                            text,evidence=self.check(step,precondition,True)
                     except AssertionError as exc:
                         raise m.BlockedStep('사전조건 미충족: '+str(exc)) from exc
                     stage.update(status='passed',actual=text,evidence=evidence or [self.evidence('사전조건 없음')],preconditions_verified=True,expectations_verified=True)
@@ -776,6 +782,8 @@ class Workflow:
                             case['evidence'].append({'url':evidence['screenshot_url'],'file':evidence.get('screenshot_file'),'findings':evidence.get('findings',[])})
                     case['ai_assisted']=bool(case['verification'])
                     case['note']=result_note(case,step)
+                    if self.data.get('approved_scope'):
+                        case['note']+='\n승인된 검증 범위: '+self.data['approved_scope']['note']
                     if self.saved_version:
                         case['note']='저장 자동화 '+self.saved_version+' · Appium\n'+case['note'].replace('AI TC RUN','저장 TC 실행',1)
                     latest=next((e for e in reversed(case['evidence']) if e.get('url')), {})
@@ -914,6 +922,13 @@ def register(app, host):
                 raise ValueError('TC 파일/내용/프로젝트가 변경되었습니다. 새 계획이 필요합니다.')
             if environment_key(m) != item['environment']:
                 raise ValueError('앱 버전 또는 기기가 변경되어 재검증이 필요합니다.')
+            scope=item.get('approved_scope')
+            if scope:
+                package=item['environment']['package']
+                actual_code=re.search(r'versionCode=(\d+)',m.adb_text('shell','dumpsys','package',package))
+                if (scope.get('android') != item['environment']['android'] or not actual_code
+                        or actual_code[1] != str(scope.get('version_code'))):
+                    raise ValueError('승인된 Android/빌드 검증 범위와 현재 기기가 다릅니다.')
             run = Workflow(m, originals, metadata, indices, item['ai_mode'])
             if run.steps != item['steps']:
                 raise ValueError('실행기 변환 기준이 변경되었습니다. 다시 준비하세요.')
@@ -927,6 +942,8 @@ def register(app, host):
             run.data.update(automation_version=version,automation_digest=item['digest'],engine='appium',
                             plans=copy.deepcopy(run.plans),plan_digest=run.digest,
                             verifier='literal-ui-text' if run.offline_checks is not None else 'ai-assisted-visual')
+            if scope:
+                run.data['approved_scope']=copy.deepcopy(scope)
             run.state, run.message = 'ready', '저장 버전 준비 완료 · Appium · 실행 전 승인 필요'
             run.planning = {i:{'status':'ready','retry_count':0,'errors':[]} for i in range(1,len(run.steps)+1)}
             service['current'] = run

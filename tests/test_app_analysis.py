@@ -202,6 +202,25 @@ class ApiTests(unittest.TestCase):
         r = self.call('/api/app-analysis/builds', method='POST', headers=self.headers, json={})
         self.assertEqual(r.status_code, 415)
 
+    def test_delete_build_and_register_fresh(self):
+        store = self.app.extensions['app_analysis'].store
+        build, _ = store.register(apk(), 'delete-fixture.apk')
+        sha = build['sha256']
+        evidence = Path(self.temp.name) / 'execution-evidence.txt'
+        evidence.write_text('preserved')
+        with store.connect() as db:
+            db.execute('INSERT INTO jobs(id,build_sha256,status,started_at) VALUES (?,?,?,?)', ('fixture',sha,'running',a.now()))
+        url = '/api/app-analysis/builds/'+sha
+        self.assertEqual(self.call(url, method='DELETE', headers=self.headers,json={'confirm':True}).status_code,409)
+        with store.connect() as db:
+            db.execute("UPDATE jobs SET status='completed' WHERE id='fixture'")
+        self.assertEqual(self.call(url, method='DELETE', headers=self.headers,json={'confirm':True}).status_code,200)
+        self.assertFalse(store.path(sha).exists())
+        self.assertEqual(evidence.read_text(),'preserved')
+        fresh, duplicate = store.register(apk(), 'fresh.apk')
+        self.assertFalse(duplicate)
+        self.assertIsNone(fresh['job'])
+
     def test_arbitrary_parameters_rejected(self):
         r = self.call('/api/app-analysis/builds/'+'a'*64+'/analyze', method='POST',
                       headers=self.headers, json={'path':'C:/secret'})

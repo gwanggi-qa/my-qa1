@@ -64,7 +64,7 @@ def options(payload):
     if (not isinstance(ids, list) or not 1 <= len(ids) <= 8 or
             any(not isinstance(i, str) or not re.fullmatch(r'[0-9a-f]{32}', i) for i in ids) or len(set(ids)) != len(ids)):
         raise AnalysisError('Select 1-8 distinct reference materials.')
-    if type(count) is not int or not 1 <= count <= 20 or type(payload['include_images']) is not bool:
+    if type(count) is not int or not 0 <= count <= 20 or type(payload['include_images']) is not bool:
         raise AnalysisError('Count must be 1-20; include_images must be boolean.')
     if not isinstance(scope, str) or not scope.strip() or len(scope) > 500:
         raise AnalysisError('Enter a scope of 1-500 characters.')
@@ -229,6 +229,8 @@ class DraftService:
         self.status = status or (lambda: {'configured': False, 'provider': 'unavailable', 'model': ''})
         self.lock = threading.Lock()
         self.active_id, self.cancel, self.worker = None, threading.Event(), None
+        import draft_batches
+        draft_batches.initialize(store)
 
     def context(self, sha, payload):
         status = self.status()
@@ -253,6 +255,8 @@ class DraftService:
         result['timeout_seconds'] = (result['metrics'] or {}).get('timeout_seconds')
         result['error_code'] = (result['metrics'] or {}).get('error_code')
         result['stopping'] = self.active_id == job_id and self.cancel.is_set() and result['status'] == 'running'
+        import draft_batches
+        draft_batches.describe(self, result)
         return result
 
     def list(self, sha):
@@ -280,6 +284,9 @@ class DraftService:
                                 encoded({'timeout_seconds': DRAFT_TIMEOUT_S, 'error_code': None, 'elapsed_seconds': 0})))
                 except sqlite3.IntegrityError as exc:
                     raise AnalysisError('Another TC generation is running.', 409) from exc
+            if context['requested_count'] == 0:
+                import draft_batches
+                draft_batches.create(self, job_id, images)
             self.active_id, self.cancel = job_id, threading.Event()
             self.worker = threading.Thread(target=self.run, args=(job_id, context, images, self.cancel), daemon=True)
             try:
@@ -293,6 +300,9 @@ class DraftService:
         return self.get(sha, job_id)
 
     def run(self, job_id, context, images, cancel):
+        if context['requested_count'] == 0:
+            import draft_batches
+            return draft_batches.run(self, job_id, context, cancel)
         metrics = {'planner_calls': 0, 'usage': {}, 'response_received': False,
                    'timeout_seconds': DRAFT_TIMEOUT_S, 'error_code': None, **context['provider']}
         status, original, cases, error = 'completed', None, None, None
@@ -369,9 +379,9 @@ class DraftService:
 
     def export(self, sha, job_id):
         batch = self.get(sha, job_id)
-        cases = [c for c in batch['cases'] or [] if c['review_status'] == 'approved']
+        cases = [c for c in batch['cases'] or [] if c['review_status'] != 'rejected']
         if not cases:
-            raise AnalysisError('Approve at least one reviewed TC before exporting.', 409)
+            raise AnalysisError('No generated TC is available for export.', 409)
         book = tc_format.workbook(tc_format.draft_row(case) for case in cases)
         sources = book.create_sheet('Sources')
         sources.append(['Evidence ID', 'Reference ID', 'Location', 'Excerpt', 'Kind', 'Filename', 'Reference SHA256', 'Build SHA256'])
@@ -383,6 +393,13 @@ class DraftService:
             for cell in sources[sources.max_row]:
                 cell.data_type = 's'
         tc_format.style_table(sources, (24,24,48,60,24,40,48,48))
+        if 'coverage' in batch:
+            coverage = book.create_sheet('Coverage')
+            tc_format.append_text(coverage, ['검증 범위', '상태', 'TC ID', '근거 ID'])
+            for unit in batch['coverage']:
+                tc_format.append_text(coverage, [unit['title'], unit.get('status', '미완료'),
+                    ', '.join(unit.get('case_ids', [])), ', '.join(unit['source_ids'])])
+            tc_format.style_table(coverage, (60,28,40,40))
         return tc_format.save(book)
 
 
@@ -423,6 +440,13 @@ def register_draft_routes(api, store, refs, runner=None, status=None):
         if request.get_json() != {}:
             raise AnalysisError('Stop accepts an empty JSON object.')
         return jsonify(service.stop(sha, job_id))
+
+    @api.post('/api/app-analysis/builds/<sha>/drafts/<job_id>/resume')
+    def draft_resume(sha, job_id):
+        import draft_batches
+        if request.get_json() != {'consent': True}:
+            raise AnalysisError('AI resume consent is required.')
+        return jsonify(draft=draft_batches.resume(service, sha, job_id)), 202
 
     @api.patch('/api/app-analysis/builds/<sha>/drafts/<job_id>/cases/<case_id>')
     def draft_review(sha, job_id, case_id):
