@@ -6,11 +6,19 @@
   function message(text){$('message').textContent=text;}
   function canStart(){return flow?.state==='ready'&&(flow.executable_count??flow.cases?.filter(c=>c.plan&&!c.plan.blocked_reason).length??0)>0;}
   const planLabels={pending:'분석 대기',retrying:'재계획 중',ready:'준비 완료',repaired:'재계획 완료',fallback:'일반 실행 전환',blocked:'실행 불가'};
+  function context(){
+    const selected=[...document.querySelectorAll('.tc-flow-selection:checked')].map(e=>steps[Number(e.value)-1]?.case_no||e.value);
+    const targets=flow?.cases?.length?flow.cases.map(c=>c.case_no):selected;
+    document.getElementById('tc-upload-context').textContent=`파일: ${metadata.filename||'없음'} · 전체 ${steps.length}개 · ${flow?'이번 실행 대상':'선택 대상'}: ${targets.length?targets.join(', '):(steps.length?'전체 '+steps.length+'개':'없음')}`;
+  }
+  document.addEventListener('change',e=>{if(e.target.matches('.tc-flow-selection'))context();});
   function render(){const state=flow?.state||'selection';
+    context();
+    document.getElementById('btn-tc-reset').disabled=busy||['preparing','running'].includes(state);
     document.querySelectorAll('#tc-flow-steps [data-phase]').forEach(el=>{const active=el.dataset.phase===state;el.style.color=active?'#53d8c0':'';el.style.fontWeight=active?'700':'';el.setAttribute('aria-current',active?'step':'false');});
     const active=['preparing','running'].includes(state);
     if(['finished','stopped'].includes(state)&&flow?.results&&window.setWorkbookExport){
-      window.setWorkbookExport({workflow_id:flow.id,run_id:flow.results.run_id,filename:'testcase-results.xlsx'});
+      window.setWorkbookExport({workflow_id:flow.id,run_id:flow.results.run_id,filename:'testcase-results-'+flow.results.run_id+'.xlsx'});
     }
     $('start').disabled=busy||!canStart();$('stop').disabled=busy||!['preparing','ready','running'].includes(state);
     $('export').disabled=busy||!['finished','stopped'].includes(state)||!flow?.results;$('consent').disabled=busy||active;
@@ -27,7 +35,7 @@
     if(data.workflow&&data.workflow.file_hash===metadata.file_hash&&data.workflow.upload_id===metadata.upload_id){flow=data.workflow;render();if(['preparing','running'].includes(flow.state))timer=setTimeout(poll,1500);}
   }catch(e){if(serial===version){message('상태 확인 지연: '+e.message);timer=setTimeout(poll,5000);}}}
   function uploaded(data){const changed=metadata.upload_id!==data.metadata?.upload_id;metadata=data.metadata||{};steps=data.steps||[];
-    if(changed){++version;clearTimeout(timer);flow=null;$('consent').checked=false;$('plan').hidden=true;message(`${steps.length}개 TC · 기대결과를 판정 기준으로 사용 · 실행결과는 별도 저장`);render();poll();}}
+    if(changed){++version;clearTimeout(timer);flow=null;$('consent').checked=false;$('plan').hidden=true;$('cases').replaceChildren();message(`${steps.length}개 TC · 기대결과를 판정 기준으로 사용 · 실행결과는 별도 저장`);render();poll();}requestAnimationFrame(context);}
   window.addEventListener('tc-uploaded',e=>uploaded(e.detail));
   window.tcWorkflow={prepare:async aiMode=>{if(busy||['preparing','running'].includes(flow?.state))return;
     const indices=[...document.querySelectorAll('.tc-flow-selection:checked')].map(e=>Number(e.value));
@@ -39,7 +47,7 @@
   }};
   $('start').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{const data=await api(flow.id+'/start',{plan_digest:flow.plan_digest,approved:true});flow=data.workflow;render();poll();}catch(e){error=e.message;}finally{busy=false;render();if(error)message(error);}};
   $('stop').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{await api(flow.id+'/stop',{});message('중단 처리 중');poll();}catch(e){error=e.message;}finally{busy=false;render();message(error||'중단 처리 중');}};
-  $('export').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{const res=await fetch('/api/tc-workflow/'+flow.id+'/export');if(!res.ok)throw Error((await res.json()).error);const url=URL.createObjectURL(await res.blob());const a=document.createElement('a');a.href=url;a.download='testcase-results.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}catch(e){error=e.message;}finally{busy=false;render();if(error)message(error);}};
+  $('export').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{const res=await fetch('/api/tc-workflow/'+flow.id+'/export');if(!res.ok)throw Error((await res.json()).error);const url=URL.createObjectURL(await res.blob());const a=document.createElement('a');a.href=url;a.download='testcase-results-'+flow.results.run_id+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}catch(e){error=e.message;}finally{busy=false;render();if(error)message(error);}};
   window.addEventListener('pagehide',()=>{++version;clearTimeout(timer);});
   fetch('/api/testcase').then(r=>r.json()).then(uploaded).catch(e=>message(e.message));
 })();

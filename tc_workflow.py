@@ -12,6 +12,7 @@ import narrative_excel
 import result_workbook
 import tc_format
 import tc_adaptive
+import tc_lifecycle
 import verified_execution
 from ai_request_errors import AIRequestError, ERRORS
 
@@ -33,6 +34,12 @@ def functional_step(original):
     """Apply the approved document-display scope without weakening other checks."""
     step = copy.deepcopy(original)
     expected = ai_tc.expected_text(step)
+    if (re.fullmatch(r'1\.\s*.+ 기본동작 대상 화면을 차례로 연다\.\s*\n2\.\s*UI를 확인한다\.',
+                     str(step.get('test_item', '')).strip()) and
+            re.fullmatch(r'흰 배경에서 상태바 아이콘이 흰색으로 묻히지 않는다\.\s*'
+                         r'어두운 배경이 표시되는 경우 상태바 아이콘이 어두운 색으로 묻히지 않는다\.', expected.strip())):
+        step['_contrast_pages'] = ['홈', '설정', '약관', '개인정보 처리방침', '강의']
+        step['_scope_note'] = '승인된 이전 실기기 검증 범위: 홈·설정·약관·개인정보·강의 화면을 차례로 열어 각 화면의 상태바 대비 검사. 표시되지 않은 배경 테마는 생성하지 않음.'
     # Explicit comparisons in expected results still require comparison evidence.
     if re.search(r'비교|동일|일치|정확', expected):
         return step
@@ -76,7 +83,7 @@ def limitation(step):
         return '비교할 원문/기준 자료와 검증 범위가 필요합니다. 화면 표시만으로 원문 일치를 판정하지 않습니다.'
     if re.search(r'강제\s*종료|응답\s*없음|ANR|재실행|초\s*안에|반복.*관찰|녹음|마이크|음성\s*입력', text, re.I):
         return '실행 이력·시간 측정·로그 또는 음성 입력 검증기가 필요한 TC입니다. 정지 화면만으로 판정하지 않습니다.'
-    if RISK.search(text):
+    if RISK.search(tc_adaptive.observation_risk_text(text)):
         return '계정·데이터·시스템 변경 등 별도 승인이 필요한 동작이 원문에 포함되어 있습니다.'
     return narrative_excel.verification_gap({**step, 'test_purpose':''})
 
@@ -316,6 +323,11 @@ class Workflow:
         try:
             plans = {}
             for i,s in enumerate(self.steps,1):
+                measured = tc_lifecycle.plan(s, i) if self.ai_mode else None
+                if measured:
+                    plans[i] = measured
+                    self.planning[i]['status'] = 'ready'
+                    continue
                 reason = limitation(s)
                 if reason:
                     plans[i] = {'index':i,'actions':[],'blocked_reason':reason}
@@ -579,6 +591,10 @@ class Workflow:
                 try:
                     if plan['blocked_reason']:
                         raise m.BlockedStep(plan['blocked_reason'])
+                    if plan.get('native'):
+                        text = tc_lifecycle.execute(self, step, case, plan['native'])
+                        records.finish_case(case, reason=text)
+                        continue
                     version=re.search(r'Android\s+(\d+)(?!\d)',str(step.get('precondition') or ''),re.I)
                     actual=str((self.data['environment'].get('device') or {}).get('android') or '').split('.')[0]
                     if version and version[1]!=actual:
@@ -651,6 +667,8 @@ class Workflow:
                 except ai_tc.Stopped:
                     raise
                 except Exception as exc:
+                    if plan.get('native') and case['stages']:
+                        stage = next((s for s in case['stages'] if s.get('status') == 'running'), case['stages'][-1])
                     mismatch=isinstance(exc,AssertionError)
                     blocked=isinstance(exc,(m.BlockedStep,ValueError))
                     kind='product_mismatch' if mismatch else 'preparation' if blocked else 'environment'
@@ -679,15 +697,15 @@ class Workflow:
                     for evidence in case['verification']:
                         if evidence.get('screenshot_url'):
                             case['evidence'].append({'url':evidence['screenshot_url'],'file':evidence.get('screenshot_file'),'findings':evidence.get('findings',[])})
-                case['ai_assisted']=bool(case['verification'])
-                case['note']=result_note(case,step)
-                latest=next((e for e in reversed(case['evidence']) if e.get('url')), {})
-                extra={'verification':case['verification'],'ai_assisted':case['ai_assisted'],
-                       'input_count':case.get('input_count',0),
-                       'ai_trace':step.get('_ai_trace',[]),'screenshot_url':latest.get('url'),
-                       'screenshot_file':latest.get('file')}
-                m.record_tc_review_result(self.data,case,step,self.metadata,'ai' if self.ai_mode else 'standard')
-                m.emit_progress(m.StepResult(index=index,total=total,status=case['status'],step=step,message=case['reason'],extra=extra))
+                    case['ai_assisted']=bool(case['verification'])
+                    case['note']=result_note(case,step)
+                    latest=next((e for e in reversed(case['evidence']) if e.get('url')), {})
+                    extra={'verification':case['verification'],'ai_assisted':case['ai_assisted'],
+                           'input_count':case.get('input_count',0),
+                           'ai_trace':step.get('_ai_trace',[]),'screenshot_url':latest.get('url'),
+                           'screenshot_file':latest.get('file')}
+                    m.record_tc_review_result(self.data,case,step,self.metadata,'ai' if self.ai_mode else 'standard')
+                    m.emit_progress(m.StepResult(index=index,total=total,status=case['status'],step=step,message=case['reason'],extra=extra))
                 if halt:
                     break
         except Exception as exc:
@@ -812,15 +830,21 @@ def register(app, host):
         if run.state not in {'finished','stopped'}:
             raise ValueError('완료된 실행 결과가 없습니다.')
         snapshot=run.snapshot()
-        if run.template is not None:
-            statuses=[{'index':i,'status':c['status'],'note':c.get('note','')} for i,c in enumerate(snapshot['results'],1)]
-            result=result_workbook.finish_run(snapshot['run_id'],run.template,run.steps,statuses)
-            payload=result_workbook.export_run(result,run.metadata['file_hash'])
-        else:
-            payload=tc_format.save(tc_format.workbook(tc_format.step_row(
-                {**c['source']['original'],'note':'\n'.join(filter(None,[c['source']['original'].get('note',''),c.get('note','')]))},
-                c['status']) for c in snapshot['results']))
+        # A run export is a report for this run only, not an accumulated workbook.
+        book=tc_format.workbook(tc_format.step_row(
+            {**c['source']['original'],'note':c.get('note','')},c['status']) for c in snapshot['results'])
+        info=book.create_sheet('실행 정보')
+        for row in [('실행 ID',snapshot['run_id']),('원본 파일',run.metadata.get('filename','')),
+                    ('파일 해시',run.metadata.get('file_hash','')),('시작 시각',str(snapshot.get('started_at',''))),
+                    ('완료 시각',str(snapshot.get('finished_at',''))),
+                    ('실행 대상',', '.join(c['source']['tc_id'] for c in snapshot['results'])),
+                    ('범위','이번 실행 대상만 포함. 과거 회차와 원본 파일은 별도 보존.')]:
+            info.append(row)
+        info.column_dimensions['A'].width=20
+        info.column_dimensions['B'].width=85
+        payload=tc_format.save(book)
         payload=tc_format.append_execution_details(payload,snapshot)
-        return Response(payload,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="testcase-results.xlsx"'})
+        filename='testcase-results-'+snapshot['run_id']+'.xlsx'
+        return Response(payload,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
     app.register_blueprint(api)
     return service

@@ -143,7 +143,7 @@ class WorkflowTests(unittest.TestCase):
         self.host.record_tc_review_result.assert_called_once()
         self.assertEqual(self.host.record_tc_review_result.call_args.args[1]['status'],'failed')
 
-    def test_standard_format_roundtrip_preserves_manual_result_and_other_rows(self):
+    def test_run_export_preserves_selected_manual_result_and_excludes_history(self):
         rows=[tc_format.step_row({**step(),'case_no':'DTC-001','depth1':'설정','qa_result':'PASS','automation_result':'FAIL','note':'keep manual note'}),
               tc_format.step_row({**step(),'case_no':'DTC-002','depth1':'설정','qa_result':'FAIL'})]
         book=tc_format.workbook(rows)
@@ -166,18 +166,18 @@ class WorkflowTests(unittest.TestCase):
         exported=self.call(flow.id+'/export')
         self.assertEqual(exported.status_code,200)
         result=load_workbook(io.BytesIO(exported.data))
-        self.assertEqual(result['TestCase']['L2'].value,'PASS')
-        self.assertEqual(result['TestCase']['L3'].value,'FAIL')
-        self.assertEqual(result['TestCase']['M2'].value,'FAIL')
-        self.assertEqual(result['TestCase']['M3'].value,'PASS')
-        self.assertEqual(result['TestCase']['N2'].value,'keep manual note')
-        self.assertEqual(result['TestCase']['K3'].value,step()['expected'])
+        self.assertEqual(result['TestCase']['A2'].value,'DTC-002')
+        self.assertEqual(result['TestCase']['L2'].value,'FAIL')
+        self.assertEqual(result['TestCase']['M2'].value,'PASS')
+        self.assertEqual(result['TestCase'].max_row,2)
+        self.assertEqual(result['TestCase']['K2'].value,step()['expected'])
+        self.assertIn('실행 정보',result.sheetnames)
+        self.assertNotIn('Sources',result.sheetnames)
         details=result[result.sheetnames[-1]]
         self.assertEqual(details['A2'].value,'DTC-002')
         self.assertEqual(details['D2'].value,'PASS')
         self.assertTrue(details['F2'].value)
-        with zipfile.ZipFile(io.BytesIO(raw)) as before,zipfile.ZipFile(io.BytesIO(exported.data)) as after:
-            self.assertEqual(before.read('xl/worksheets/sheet2.xml'),after.read('xl/worksheets/sheet2.xml'))
+        self.assertEqual(load_workbook(io.BytesIO(raw))['Sources']['A1'].value,'preserve source evidence')
         result.close()
 
     def test_generated_excel_headers_parse_and_execute_without_result_column(self):

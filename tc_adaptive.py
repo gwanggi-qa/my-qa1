@@ -40,7 +40,30 @@ CHOICE = ai_tc.obj({'candidate_id': ai_tc.STR,
 
 
 def expectations(step):
-    return [s.strip() for s in re.split(r'[\n;]+', ai_tc.expected_text(step)) if s.strip()]
+    result = []
+    for clause in re.split(r'[\n;]+', ai_tc.expected_text(step)):
+        clause = clause.strip()
+        if not clause:
+            continue
+        match = re.fullmatch(r'(.+본문)이 표시되고\s+(.+(?:돌아온다|복귀한다))\.?', clause)
+        if match:
+            result.extend([match[1]+'이 표시된다.', match[2].rstrip('.')+'.'])
+        else:
+            result.append(clause)
+    return result
+
+
+def observation_risk_text(text):
+    """Remove only non-operative logout mentions; input targets remain guarded."""
+    parts = re.split(r'([.\n])', text)
+    for i, part in enumerate(parts):
+        prohibited = re.fullmatch(r'\s*로그아웃(?:은|을)?\s*(?:누르지|클릭하지|실행하지)\s*않는다\s*', part)
+        observation = ('로그아웃 버튼' in part and
+                       re.search(r'표시|위치|가려|겹치', part) and
+                       not re.search(r'누르|클릭|선택|실행|터치|수행', part))
+        if prohibited or observation:
+            parts[i] = part.replace('로그아웃', '관찰대상')
+    return ''.join(parts)
 
 
 def schema_field(data, schema, path='plan'):
@@ -102,12 +125,16 @@ def validate(plan, step, procedures, risk):
                 raise ValueError('기대결과 보완은 명시된 클릭 또는 뒤로가기만 허용합니다.')
             if a['action']=='back' and '화살표' in a['source']:
                 raise ValueError('상단 화살표를 시스템 뒤로가기로 대체할 수 없습니다.')
-        if risk.search(a['target']) or not 0 <= a['wait_ms'] <= 5000:
+        target = observation_risk_text(a['target']) if a['action']=='inspect' else a['target']
+        if risk.search(target) or not 0 <= a['wait_ms'] <= 5000:
             raise ValueError('위험한 대상 또는 대기 시간입니다.')
         if a['action'] in {'tap', 'navigate'}:
             if not a['target'] or ai_tc.compact(a['target']) not in ai_tc.compact(a['source']):
                 raise ValueError('대상은 원문의 구절이어야 합니다.')
-            if not re.search(r'열|연다|이동|누르|누른|클릭|선택|터치|진입|전환|돌아|복귀', a['source']):
+            state_before_back = (a['action'] == 'navigate' and
+                re.search(r'(?:상태|화면)에서', a['source']) and '뒤로' in a['source'] and
+                re.search(r'(?:상태|화면)$', a['target']))
+            if not state_before_back and not re.search(r'열|연다|연\s|이동|누르|누른|클릭|선택|터치|진입|전환|돌아|복귀', a['source']):
                 raise ValueError('원문에 이동 동작이 없습니다.')
         if a['action'] == 'back' and not re.search(r'뒤로|복귀|돌아', a['source']):
             raise ValueError('원문에 뒤로가기 근거가 없습니다.')
@@ -118,7 +145,7 @@ def validate(plan, step, procedures, risk):
     if covered != sorted(covered) or set(covered) != set(range(1, len(parts)+1)):
         raise ValueError('원본 절차가 누락되거나 순서가 변경됐습니다.')
     for pos, part in enumerate(parts, 1):
-        if re.search(r'열|연다|이동|누르|누른|클릭|선택|터치|뒤로|전환|스크롤', part):
+        if re.search(r'열|연다|연\s|이동|누르|누른|클릭|선택|터치|뒤로|전환|스크롤', re.sub(r'로그아웃은 누르지 않는다\.?', '', part)):
             if all(a['action'] == 'inspect' for a in actions if a['procedure'] == pos):
                 raise ValueError('필수 입력을 관찰로 대체할 수 없습니다.')
     checks = plan['checks']

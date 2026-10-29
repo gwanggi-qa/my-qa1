@@ -1849,6 +1849,9 @@ def test_case_label(step, index):
 def foreground_app_evidence():
     focus = adb_text("shell", "dumpsys", "window", "windows")
     match = re.search(r"mCurrentFocus=.*?\s([A-Za-z0-9_.]+)/", focus)
+    if not match:
+        focus = adb_text("shell", "dumpsys", "activity", "activities")
+        match = re.search(r"(?:topResumedActivity|mResumedActivity|ResumedActivity)[^\n]*?\s([A-Za-z0-9_.]+)/", focus)
     package = match.group(1) if match else ""
     version = ""
     if package:
@@ -3321,6 +3324,9 @@ def ai_test_step_is_risky(step):
         str(step.get(key) or "")
         for key in ("target", "value", "expected", "qa_expected", "description", "block_reason", "precondition", "test_item", "test_purpose")
     ).casefold()
+    if step.get('action') == 'assert_text' and step.get('_source_bound'):
+        import tc_adaptive
+        text = tc_adaptive.observation_risk_text(text)
     return any(keyword.casefold() in text for keyword in AI_TEST_RISKY_TEXT)
 
 
@@ -6009,6 +6015,7 @@ HTML = r"""
       <button id="execution-open" type="button" role="tab" aria-selected="false" aria-controls="execution-panel" tabindex="-1">대시보드</button>
     </nav>
     <a href="/app-analysis" id="apk-analysis-link" style="color:#9de6d3;white-space:nowrap;padding:8px">APK 분석</a>
+    <a href="/audio-verification" id="audio-verification-link" style="color:#9de6d3;white-space:nowrap;padding:8px">음원 검증</a>
     <div id="view-runtime-status" role="status" aria-live="polite">상태 확인 중</div>
     <div id="view-stop-controls" aria-label="실행 중단 controls"></div>
   </header>
@@ -6063,7 +6070,9 @@ HTML = r"""
           <div class="upload-panel">
             <input id="excel-file" type="file" accept=".xlsx,.xlsm" aria-label="Excel test case file">
             <button class="btn-upload" type="button" onclick="uploadTestCase()"><span class="ui-icon icon-upload" aria-hidden="true"></span>Upload</button>
+            <button class="btn-secondary" id="btn-tc-reset" type="button" onclick="resetUploadedTestCase()"><span class="ui-icon icon-clear" aria-hidden="true"></span>업로드 TC 초기화</button>
           </div>
+          <div id="tc-upload-context" role="status" style="font-size:12px;overflow-wrap:anywhere;padding:8px 0">파일: 없음 · 전체 0개 · 실행 대상: 없음</div>
           <div class="test-actions">
             <button class="btn-run" id="btn-run" type="button" onclick="runTestCase()" title="화면 구조·시각 검증 항목은 AI를 사용하며 설정된 AI 사용량이 발생합니다." disabled><span class="ui-icon icon-run" aria-hidden="true"></span>Run Test Case</button>
             <button class="btn-ai-test" id="btn-ai-test" type="button" onclick="runTestCase(true)" disabled><span class="ui-icon icon-ai-test" aria-hidden="true"></span>AI TC RUN</button>
@@ -6299,6 +6308,12 @@ HTML = r"""
   <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
   <script>
     const socket = io('/mirror', window.QALocalAccess.socketOptions());
+    socket.on('testcase_changed', async () => {
+      try {
+        const response = await fetch('/api/testcase');
+        if (response.ok) acceptUploadedTestCase(await response.json());
+      } catch (error) { statusLabel.textContent = 'TC 상태 새로고침 실패: ' + error.message; }
+    });
     const screen = document.getElementById('screen');
     const statusLabel = document.getElementById('status');
     const fpsInfo = document.getElementById('fps-info');
@@ -7176,6 +7191,18 @@ HTML = r"""
         document.getElementById('mapping-status').textContent = error.message;
         document.getElementById('mapping-confirm').disabled = false;
       }
+    }
+
+    async function resetUploadedTestCase() {
+      if (!window.confirm('현재 TC 목록, 준비된 계획, 화면 Progress를 초기화합니다. 저장된 결과와 증거는 유지됩니다.')) return;
+      try {
+        const response = await fetch('/api/testcase', {method:'DELETE'});
+        const data = await response.json();
+        if (!response.ok) throw Error(data.error || '초기화 실패');
+        fileInput.value = '';
+        acceptUploadedTestCase(data);
+        statusLabel.textContent = '업로드 TC 초기화 완료 · 저장된 결과와 증거 유지';
+      } catch (error) { statusLabel.textContent = error.message; }
     }
 
     async function uploadTestCase() {
@@ -8648,10 +8675,33 @@ def download_result_workbook(run_id):
     return response
 
 
-@app.route("/api/testcase", methods=["GET", "POST"])
+def serialize_testcase_change(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        with _automation_start_lock:
+            if request.method != "GET" and (_test_running or _random_running or _record_play_running):
+                return jsonify(error="실행 또는 계획 생성 중에는 TC를 변경할 수 없습니다."), 409
+            return handler(*args, **kwargs)
+    return wrapped
+
+
+@app.route("/api/testcase", methods=["GET", "POST", "DELETE"])
+@serialize_testcase_change
 def upload_testcase():
     global _verified_run
     global _test_steps, _test_metadata, _test_workbook, _last_workbook_run, _reviewed_plan
+
+    if request.method == "DELETE":
+        with _test_lock:
+            _test_steps = []
+            _test_metadata = {}
+            _test_workbook = None
+            _last_workbook_run = None
+            _reviewed_plan = None
+            _verified_run = None
+            tc_workflow_service['current'] = None
+        socketio.emit('testcase_changed', {}, namespace='/mirror')
+        return jsonify(steps=[], count=0, metadata={}, source="testcase", recorder_resolution=None)
 
     if request.method == "GET":
         with _test_lock:
@@ -8723,7 +8773,9 @@ def upload_testcase():
         _last_workbook_run = None
         _reviewed_plan = None
         _verified_run = None
+        tc_workflow_service['current'] = None
 
+    socketio.emit('testcase_changed', {}, namespace='/mirror')
     return jsonify(
         {
             "steps": steps,
@@ -9027,6 +9079,8 @@ def on_stop(data=None):
 
 
 tc_workflow_service = tc_workflow.register(app, lambda: sys.modules[__name__])
+import audio_service
+audio_verification_service = audio_service.register(app, lambda: sys.modules[__name__])
 
 if __name__ == "__main__":
     print("=" * 55)
