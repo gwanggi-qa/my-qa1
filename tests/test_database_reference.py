@@ -3,6 +3,8 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -34,6 +36,19 @@ class DatabaseTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.raw = database_bytes(self.temp.name)
+        # Exercise the real parser on our fixture without starting a process.
+        def inspect_fixture(command, **kwargs):
+            self.assertEqual(command[:2], [sys.executable, '-I'])
+            self.assertEqual(kwargs['timeout'], 20)
+            self.assertEqual(Path(command[3]).name, 'reference.db')
+            try:
+                output = json.dumps(dbref.inspect_file(command[3])).encode()
+                return subprocess.CompletedProcess(command, 0, output, b'')
+            except sqlite3.DatabaseError:
+                return subprocess.CompletedProcess(command, 1, b'', b'')
+        process = patch.object(dbref.subprocess, 'run', side_effect=inspect_fixture)
+        process.start()
+        self.addCleanup(process.stop)
         self.store = a.AnalysisStore(Path(self.temp.name)/'analysis')
         self.sha = self.store.register(apk(), 'fixture.apk')[0]['sha256']
         self.refs = refs.ReferenceStore(self.store)
@@ -115,6 +130,34 @@ class DatabaseTests(unittest.TestCase):
         response=client.post('/api/app-analysis/builds/'+self.sha+'/references',data={'kind':'database','file':(io.BytesIO(self.raw),'http.sqlite3')})
         self.assertIn(response.status_code,(200,201))
         self.assertEqual(response.json['reference']['preview']['format'],'database')
+
+
+class DatabaseProcessTests(unittest.TestCase):
+    def test_timeout_is_reported_and_temp_file_removed(self):
+        paths = []
+        def timeout(command, **kwargs):
+            paths.append(Path(command[3]))
+            self.assertTrue(paths[-1].exists())
+            self.assertEqual(kwargs['timeout'], 20)
+            self.assertNotIn('OPENAI_API_KEY', kwargs['env'])
+            raise subprocess.TimeoutExpired(command, 20)
+        with patch.object(dbref.subprocess, 'run', side_effect=timeout):
+            with self.assertRaises(a.AnalysisError):
+                dbref.database_preview(b'SQLite format 3\x00fixture')
+        self.assertFalse(paths[0].exists())
+
+    def test_failed_or_oversized_process_output_is_rejected(self):
+        for code, output in ((1, b''), (0, b'x' * (8 * 1024 * 1024 + 1))):
+            with self.subTest(code=code), patch.object(dbref.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess([], code, output, b'')):
+                with self.assertRaises(a.AnalysisError):
+                    dbref.database_preview(b'SQLite format 3\x00fixture')
+
+    def test_invalid_json_is_not_accepted(self):
+        with patch.object(dbref.subprocess, 'run',
+                return_value=subprocess.CompletedProcess([], 0, b'not json', b'')):
+            with self.assertRaises(json.JSONDecodeError):
+                dbref.database_preview(b'SQLite format 3\x00fixture')
 
 
 if __name__ == '__main__':
