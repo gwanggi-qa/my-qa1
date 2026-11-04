@@ -34,6 +34,11 @@ class BatchTests(DraftTests):
         book = load_workbook(io.BytesIO(self.service.export(self.sha, job['id'])))
         self.assertEqual(book['TestCase'].max_row, 3)
         self.assertIn('미검토', book['TestCase']['N2'].value)
+        self.assertEqual(book['Preparation'].max_row, 3)
+        self.assertEqual(book['Preparation']['A2'].value, job['cases'][0]['id'])
+        self.assertEqual(book['Preparation']['B2'].value, job['cases'][0]['preconditions'])
+        self.assertEqual(book['Preparation']['C2'].value or '', '\n'.join(job['cases'][0]['assumptions']))
+        self.assertEqual(book['Preparation']['D2'].value, ', '.join(job['cases'][0]['source_ids']))
         book.close()
 
     def test_stop_late_response_resume_preserves_first_chunk(self):
@@ -117,6 +122,8 @@ class BatchTests(DraftTests):
         book = load_workbook(io.BytesIO(self.service.export(self.sha, job['id'])))
         self.assertEqual(book['TestCase'].max_row, 2)
         self.assertEqual(book['TestCase']['A2'].value, 'DTC-002')
+        self.assertEqual(book['Preparation'].max_row, 2)
+        self.assertEqual(book['Preparation']['A2'].value, 'DTC-002')
         book.close()
 
 

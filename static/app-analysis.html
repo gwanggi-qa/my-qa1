@@ -41,11 +41,12 @@
           <div class="result-heading"><h3 id="reference-title">참고자료</h3><span id="reference-count">0개</span></div>
           <p id="reference-build" class="reference-status">APK를 선택하세요</p>
           <form id="reference-form">
-            <label>자료 유형<select id="reference-kind"><option value="requirements">기획서</option><option value="design">디자인</option><option value="testcase">기존 TC</option></select></label>
-            <label>파일 · 최대 20 MB<input type="file" id="reference-file" accept=".xlsx,.pdf,.md,.txt,.png,.jpg,.jpeg" required></label>
+            <label>자료 유형<select id="reference-kind"><option value="requirements">기획서</option><option value="design">디자인</option><option value="testcase">기존 TC</option><option value="database">DB</option><option value="other">기타</option></select></label>
+            <label>파일 · 최대 20 MB<input type="file" id="reference-file" accept=".xlsx,.pdf,.md,.txt,.png,.jpg,.jpeg,.db,.sqlite,.sqlite3,.dat" required></label>
             <label class="source-field">원본 Notion / Figma 주소 (선택)<input id="reference-source" type="url" maxlength="2048" placeholder="https://" autocomplete="off"></label>
             <button id="reference-upload" type="submit" disabled>참고자료 등록</button>
           </form>
+          <p class="reference-status" id="database-help">DB: SQLite 형식의 .db · .sqlite · .sqlite3 · .dat를 등록하면 테이블과 학습 구성을 분석합니다.</p>
           <form id="figma-form" class="integration-form">
             <label>Figma 프레임 링크<input id="figma-url" type="url" maxlength="2048" placeholder="https://www.figma.com/design/…?node-id=…" required></label>
             <button id="figma-import" type="submit" disabled>Figma에서 가져오기</button>
@@ -57,7 +58,7 @@
             <section class="reference-preview" aria-label="참고자료 미리보기">
               <div class="detail-heading"><h3 id="reference-name">선택된 자료 없음</h3><button id="reference-delete" type="button" disabled>삭제</button></div>
               <dl id="reference-meta"></dl>
-              <label id="reference-unit-label" hidden>시트 / 페이지<select id="reference-unit"></select></label>
+              <label id="reference-unit-label" hidden>시트 / 페이지 / 테이블<select id="reference-unit"></select></label>
               <p id="reference-warning" class="notice"></p>
               <div id="reference-content" tabindex="0"></div>
             </section>
@@ -68,11 +69,13 @@
           <div class="actions"><span class="reference-status">표준 양식: TestCase · 1~3Depth · 수동/자동화 결과 분리</span><button id="draft-template" type="button">표준 TC 양식 다운로드</button></div>
           <div id="draft-sources" aria-label="생성에 사용할 자료"></div>
           <form id="draft-form">
-            <label>생성 범위<input id="draft-scope" maxlength="500" placeholder="예: 학습 관리 화면의 LC·RC 표시와 탭 전환" required></label>
+            <label>생성 범위<input id="draft-scope" maxlength="500" placeholder="예: 1레벨 전부 학습하기 / 각 레벨별 학습하기" required></label>
             <input id="draft-count" type="hidden" value="0">
             <label class="check"><input id="draft-images" type="checkbox">선택 자료의 이미지 포함 (최대 4개)</label>
             <button id="draft-preview" type="submit" disabled>AI 입력 미리보기</button>
           </form>
+          <p class="reference-status">레벨별 생성: 기준 DB 1개와 기획·디자인 자료를 선택하세요. DB의 학습 순서를 따라 TC를 생성하며, 화면 경로·완료 조건 근거가 부족한 단계는 자료 보완 필요로 표시됩니다.</p>
+          <p id="draft-db-scope" class="database-summary" role="status" hidden></p>
           <details id="draft-input" hidden><summary>AI 전송 내용</summary><div id="draft-input-images"></div><pre id="draft-context"></pre></details>
           <label class="check"><input id="draft-consent" type="checkbox" disabled>선택 자료·이미지의 민감정보를 확인했으며, 표시된 AI provider로 전송하고 사용량이 발생하는 것에 동의합니다.</label>
           <div class="actions"><button id="draft-generate" type="button" disabled>TC 생성</button><button id="draft-stop" type="button" disabled>생성 중단</button><button id="draft-resume" type="button" disabled>미완료분 재개</button></div>

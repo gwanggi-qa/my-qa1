@@ -113,12 +113,14 @@ def validate_archive(path):
             names, expanded = set(), 0
             for entry in archive.infolist():
                 name = entry.filename
-                if (name.casefold() in names or '\\' in name or ':' in name or name.startswith('/')
+                # APK ZIP members are case-sensitive; the archive is passed intact
+                # to the analyzer, never extracted onto a Windows filesystem here.
+                if (name in names or '\\' in name or ':' in name or name.startswith('/')
                         or '..' in PurePosixPath(name).parts or entry.flag_bits & 1 or '\x00' in name):
                     raise AnalysisError('Unsafe, encrypted or duplicate APK member.')
                 if name.lower().endswith(('.apk', '.aab', '.apks')):
                     raise AnalysisError('Nested APK bundles are not supported.')
-                names.add(name.casefold())
+                names.add(name)
                 expanded += entry.file_size
                 if expanded > 1024 ** 3:
                     raise AnalysisError('Expanded APK exceeds 1 GiB.')

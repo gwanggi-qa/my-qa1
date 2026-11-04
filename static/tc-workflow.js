@@ -18,7 +18,7 @@
     document.querySelectorAll('#tc-flow-steps [data-phase]').forEach(el=>{const active=el.dataset.phase===state;el.style.color=active?'#53d8c0':'';el.style.fontWeight=active?'700':'';el.setAttribute('aria-current',active?'step':'false');});
     const active=['preparing','running'].includes(state);
     $('save').disabled=busy||!canStart();
-    ['load','library','refresh','code'].forEach(id=>$(id).disabled=busy||active);
+    ['load','library','code'].forEach(id=>$(id).disabled=busy||active);
     if(['finished','stopped'].includes(state)&&flow?.results&&window.setWorkbookExport){
       window.setWorkbookExport({workflow_id:flow.id,run_id:flow.results.run_id,filename:'testcase-results-'+flow.results.run_id+'.xlsx'});
     }
@@ -28,7 +28,7 @@
     if(flow){message(flow.message);$('plan').hidden=false;$('cases').replaceChildren();
       for(const c of flow.cases){const row=document.createElement('section');row.style.cssText='padding:8px 0;border-bottom:1px solid #3b414a;white-space:pre-wrap;overflow-wrap:anywhere';
         const actions=c.plan?.actions?.map((a,i)=>`${i+1}. ${a.basis==='expected'?'기대결과 보완':'절차 '+a.procedure}: ${a.action} ${a.target}${a.source?'\n근거: '+a.source:''}`).join('\n')||'';
-        const checkpoints=c.plan?.checks?.map(c=>`동작 ${c.after_action} 직후 기대결과 ${c.expectation} 검증`).join('\n')||'';
+        const checkpoints=(c.plan?.checks?.map(c=>`동작 ${c.after_action} 직후 기대결과 ${c.expectation} 검증`).join('\n')||'')+'\n'+(c.assertions||[]).map(a=>`검사 ${a.expectation} · ${a.method==='ui-assertion'?'화면 속성 코드 검사':'AI 시각 검증'}\n원문: ${a.source}\n${a.conditions.length?JSON.stringify(a.conditions):'현재 캡처로 원문 전체 판단 · 근거 부족 시 Block'}`).join('\n');
         const diagnostic=(c.scope_note?`\n검증 범위: ${c.scope_note}`:'')+(c.planning?`\n계획 상태: ${planLabels[c.planning.status]||c.planning.status} · 재계획 ${c.planning.retry_count}/1\n${(c.planning.errors||[]).map(e=>`${e.tc_id} · ${e.code} · ${e.field}: ${e.message}\n${e.hint}`).join('\n')}`:'');
         row.textContent=`${c.case_no} · ${c.title}\n${c.priority||'-'} · ${c.test_type||'-'} · ${(c.depths||[]).filter(Boolean).join(' > ')||'-'}\n목적: ${c.purpose||'-'}\n사전조건: ${c.precondition||'(원문 공란)'}\n${c.procedures.join('\n')}\n기대결과: ${c.expected||'(없음)'}\n${c.plan?.blocked_reason?'Block: '+c.plan.blocked_reason:actions||'계획 준비 중'}${diagnostic}${checkpoints?'\n안전 보완: 사전조건 준비·기존 항목 선택, TC당 최대 5회\n'+checkpoints:''}`;$('cases').append(row);}
     }
@@ -49,7 +49,6 @@
   }};
   $('start').onclick=async()=>{if(!flow||busy)return;busy=true;render();let error='';try{const data=await api(flow.id+'/start',{plan_digest:flow.plan_digest,approved:true});flow=data.workflow;render();poll();}catch(e){error=e.message;}finally{busy=false;render();if(error)message(error);}};
   async function refreshLibrary(){const data=await api('library');const previous=$('library').value;$('library').replaceChildren(new Option('저장 버전 선택',''));for(const item of data.versions){const states={approved:'승인·미검증',device_verified:'실기기 검증 완료',needs_review:'결과 검토 필요'};$('library').add(new Option(`${item.name} · ${item.version.slice(0,8)} · ${states[item.validation_state]} · ${item.ai_required?'AI 검사·복구 사용':'AI 없이 반복'} · ${item.approved_at}`,item.version));}if([...$('library').options].some(o=>o.value===previous))$('library').value=previous;}
-  $('refresh').onclick=()=>refreshLibrary().catch(e=>message(e.message));
   $('save').onclick=async()=>{if(busy||!canStart())return;if(!confirm('표시된 절차와 기대결과 검사 조건을 승인하여 새 버전으로 저장할까요? 저장만으로 실기기 검증 완료가 되지는 않습니다.'))return;busy=true;render();let msg;try{const data=await api(flow.id+'/save',{approved:true,plan_digest:flow.plan_digest});await refreshLibrary();$('library').value=data.version;msg='승인 버전 저장 완료 · 불러온 뒤 실기기 시험 실행하세요.';}catch(e){msg=e.message;}finally{busy=false;render();message(msg);}};
   $('load').onclick=async()=>{if(busy||!$('library').value)return;busy=true;render();let msg;try{const data=await api('library/'+$('library').value+'/load',{consent:$('consent').checked});flow=data.workflow;$('plan').open=true;render();msg=flow.message;}catch(e){msg=e.message;}finally{busy=false;render();message(msg);}};
   $('code').onclick=async()=>{if(!$('library').value)return;try{const r=await fetch('/api/tc-workflow/library/'+$('library').value+'/code');if(!r.ok)throw Error((await r.json()).error);const u=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=u;a.download='automation-'+$('library').value+'.py';a.click();setTimeout(()=>URL.revokeObjectURL(u),10000);}catch(e){message(e.message);}};

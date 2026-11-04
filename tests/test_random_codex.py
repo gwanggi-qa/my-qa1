@@ -23,6 +23,14 @@ def response(ids):
 
 
 class RandomCodexTests(unittest.TestCase):
+    def test_ui_candidate_score_preserves_priority_and_penalties(self):
+        center = {'area': 2000}
+        self.assertEqual(m.ui_node_score('학습 Tab', {}, center), 12)
+        self.assertEqual(m.ui_node_score('학습 Tab', {'selected': 'true'}, center), 10)
+        self.assertEqual(m.ui_node_score('Other', {'scrollable': 'true'}, center), 9)
+        self.assertEqual(m.ui_node_score('', {'clickable': 'true'}, center), 3)
+        self.assertEqual(m.ui_node_score('', {'enabled': 'false'}, {'area': 100}), 1)
+
     def setUp(self):
         m._random_stop_event.clear()
         m._codex_status_cache.clear()

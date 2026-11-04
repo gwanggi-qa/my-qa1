@@ -21,12 +21,13 @@ if __name__ == '__main__':
 
 from app_analysis import AnalysisError, now
 from workbook_safety import validate_workbook
+from database_reference import DB_EXTENSIONS, database_preview
 
 MAX_FILE = 20 * 1024 * 1024
 MAX_TOTAL = 100 * 1024 * 1024
 MAX_TEXT = 100000
-KINDS = {'requirements', 'design', 'testcase'}
-EXTENSIONS = {'.md', '.txt', '.xlsx', '.pdf', '.png', '.jpg', '.jpeg'}
+KINDS = {'requirements', 'design', 'testcase', 'database', 'other'}
+EXTENSIONS = {'.md', '.txt', '.xlsx', '.pdf', '.png', '.jpg', '.jpeg'} | DB_EXTENSIONS
 META = 'id,build_sha256,sha256,filename,kind,source_url,size_bytes,created_at'
 
 
@@ -180,6 +181,8 @@ def pdf_preview(data):
 
 def preview(data, extension):
     try:
+        if extension in DB_EXTENSIONS:
+            return database_preview(data), None
         if extension in {'.md', '.txt'}:
             return text_preview(data), None
         if extension == '.xlsx':
@@ -234,9 +237,13 @@ class ReferenceStore:
         if not name or len(name) > 180 or any(ord(c) < 32 for c in name):
             raise AnalysisError('Invalid reference filename.')
         if extension not in EXTENSIONS:
-            raise AnalysisError('Supported files: XLSX, PDF, MD, TXT, PNG, JPG.', 415)
+            raise AnalysisError('지원 파일: XLSX, PDF, MD, TXT, PNG, JPG, DB, SQLITE, SQLITE3, DAT.', 415)
         if kind not in KINDS:
-            raise AnalysisError('Select requirements, design or testcase.')
+            raise AnalysisError('자료 유형을 선택하세요: 기획서, 디자인, 기존 TC, DB, 기타.')
+        if kind == 'database' and extension not in DB_EXTENSIONS:
+            raise AnalysisError('DB 유형에는 .db, .sqlite, .sqlite3, .dat 파일을 등록하세요.', 415)
+        if extension in DB_EXTENSIONS and kind not in {'database', 'other'}:
+            raise AnalysisError('DB 파일의 자료 유형은 DB 또는 기타를 선택하세요.')
         source_url = provenance(source_url)
         if not self.lock.acquire(blocking=False):
             raise AnalysisError('Another reference upload is being processed.', 409)

@@ -1,6 +1,5 @@
 """Source-bound TC preparation and approved execution, independent of result columns."""
 import copy
-import io
 import re
 import threading
 import uuid
@@ -9,13 +8,13 @@ from flask import Blueprint, jsonify, request, Response
 import ai_tc
 import execution_results as records
 import narrative_excel
-import result_workbook
 import tc_format
 import tc_adaptive
 import tc_lifecycle
 import verified_execution
 import automation_library
 import prepared_appium
+import expectation_checks
 from ai_request_errors import AIRequestError, ERRORS
 
 ACTION = ai_tc.obj({'procedure': {'type': 'integer'},
@@ -137,18 +136,10 @@ def standard_plan(step, index):
             reason = reason or '문장형 절차 해석이 필요합니다. AI TC RUN으로 계획을 준비하세요.'
     checks = []
     for value in (str(step.get('precondition') or ''), ai_tc.expected_text(step)):
-        group = []
-        for clause in value.splitlines():
-            if not clause.strip():
-                continue
-            match = re.fullmatch(r'["“\'](.+?)["”\']\s*(?:이|가|은|는)?\s*(표시된다|존재한다|표시되지 않는다)\.?', clause.strip())
-            if not match:
-                reason = reason or '기대결과/사전조건의 시각·문장 검증은 AI TC RUN이 필요합니다.'
-                continue
-            check = {'source':clause,'selector':{'text':match[1]},'present':match[2]!='표시되지 않는다'}
-            verified_execution.validate_atomic_check(check)
-            group.append(check)
-        checks.append(group)
+        group = expectation_checks.compile_text(value)
+        if group is None:
+            reason = reason or '기대결과/사전조건의 시각·문장 검증은 AI TC RUN이 필요합니다.'
+        checks.append(group or [])
     return {'index':index,'actions':[] if reason else actions,'blocked_reason':reason}, checks
 
 
@@ -161,16 +152,9 @@ def literal_checks(steps, plans):
         values=[str(step.get('precondition') or ''),ai_tc.expected_text(step),*tc_adaptive.expectations(step)]
         compiled={}
         for value in values:
-            checks=[]
-            for clause in value.splitlines():
-                if not clause.strip():
-                    continue
-                match=re.fullmatch(r'["“\'](.+?)["”\']\s*(?:이|가|은|는)?\s*(표시된다|존재한다|표시되지 않는다)\.?',clause.strip())
-                if not match:
-                    return None
-                check={'source':clause,'selector':{'text':match[1]},'present':match[2]!='표시되지 않는다'}
-                verified_execution.validate_atomic_check(check)
-                checks.append(check)
+            checks=expectation_checks.compile_text(value)
+            if checks is None:
+                return None
             compiled[value]=checks
         result[i]=compiled
     return result
@@ -226,6 +210,7 @@ class Workflow:
                               'priority':s.get('priority',''),'depths':s.get('depths',[])[:3],
                               'test_type':s.get('check_type',''),'purpose':s.get('test_purpose',''),
                               'procedures':procedures(s),'expected':ai_tc.expected_text(s),
+                              'assertions':expectation_checks.describe(s,tc_adaptive.expectations),
                               'planning':copy.deepcopy(self.planning[i]),
                               'plan':copy.deepcopy(self.plans[i-1]) if len(self.plans)>=i else None}
                              for i,s in enumerate(self.steps,1)],
@@ -402,24 +387,33 @@ class Workflow:
         self.guard()
         if not expected.strip():
             return '명시된 사전조건 없음', []
+        compiled = expectation_checks.compile_text(expected)
+        if compiled:
+            xml = self.appium.xml() if self.appium else self.host.dump_ui_xml()
+            evidence = self.evidence('기대결과 코드 검사')
+            evidence.update(method='ui-assertion', conditions=compiled, findings=[])
+            error = None
+            try:
+                evidence['findings'] = expectation_checks.evaluate(xml, compiled)
+            except ValueError as exc:
+                error = exc
+                evidence['unverified_reason'] = str(exc)
+            self.guard()
+            # Persist observations even when the assertion fails.
+            step.setdefault('_workflow_verifications', []).append(copy.deepcopy(evidence))
+            case = next((c for c in self.data.get('results', []) if c.get('index') == step.get('_workflow_index')), None)
+            if case and case.get('stages'):
+                case['stages'][-1].setdefault('evidence', []).append(evidence)
+            if error:
+                raise error
+            findings = evidence['findings']
+            if not all(f['passed'] for f in findings):
+                raise AssertionError('기대결과 코드 검사 불일치: '+str(findings))
+            return '기대결과 코드 검사 통과: '+str(findings), [evidence]
         if self.offline_checks is not None:
-            checks=self.offline_checks.get(step['_workflow_index'],{}).get(expected)
-            if not checks:
-                raise self.host.BlockedStep('저장된 검사 조건에 없는 요구입니다. 재승인이 필요합니다.')
-            xml=self.appium.xml() if self.appium else self.host.dump_ui_xml()
-            misses=[c for c in checks if (verified_execution.ui_guard.select(xml,c['selector'],optional=True) is not None)!=c['present']]
-            if misses:
-                raise AssertionError('기대 문구 조건 불일치: '+'; '.join(c['source'] for c in misses))
-            return '저장된 원문 문구 조건 모두 확인', [self.evidence('Appium 문구 검증')]
+            raise self.host.BlockedStep('저장된 검사 조건에 없는 요구입니다. 재승인이 필요합니다.')
         if not self.ai_mode or step['_workflow_index'] in self.standard_checks:
-            checks=self.standard_checks[step['_workflow_index']][0 if precondition else 1]
-            if not checks:
-                raise self.host.BlockedStep('문구 검증 조건이 없습니다. AI TC RUN을 사용하세요.')
-            xml=self.host.dump_ui_xml()
-            misses=[c for c in checks if (verified_execution.ui_guard.select(xml,c['selector'],optional=True) is not None)!=c['present']]
-            if misses:
-                raise AssertionError('기대 문구 조건 불일치: '+'; '.join(c['source'] for c in misses))
-            return '원문의 모든 문구 조건 확인', [self.evidence('검증')]
+            raise self.host.BlockedStep('문구 검증 조건이 없습니다. AI TC RUN을 사용하세요.')
         probe=copy.deepcopy(step)
         probe.update(action='assert_text',expected=expected,qa_expected=expected,precondition='',verification_gap='',
                      test_purpose='',
@@ -780,7 +774,7 @@ class Workflow:
                     for evidence in case['verification']:
                         if evidence.get('screenshot_url'):
                             case['evidence'].append({'url':evidence['screenshot_url'],'file':evidence.get('screenshot_file'),'findings':evidence.get('findings',[])})
-                    case['ai_assisted']=bool(case['verification'])
+                    case['ai_assisted']=any(e.get('method')!='ui-assertion' for e in case['verification'])
                     case['note']=result_note(case,step)
                     if self.data.get('approved_scope'):
                         case['note']+='\n승인된 검증 범위: '+self.data['approved_scope']['note']
@@ -893,6 +887,8 @@ def register(app, host):
                 'originals':originals,'steps':run.steps,'metadata':run.metadata,'indices':run.indices,
                 'plans':run.plans,'standard_checks':run.standard_checks,'ai_mode':run.ai_mode,
                 'offline_checks':compiled,'ai_required':run.ai_mode and compiled is None,
+                'assertion_revision':expectation_checks.REVISION,
+                'assertions':[expectation_checks.describe(s,tc_adaptive.expectations) for s in run.steps],
                 'engine':'appium','environment':environment})
             return jsonify(version=item['version'], ai_required=item['ai_required']),201
 
@@ -909,6 +905,9 @@ def register(app, host):
             if m._test_running or m._random_running or m._record_play_running:
                 raise ValueError('다른 실행이 진행 중입니다.')
             item = library().read(version)
+            if 'assertion_revision' in item and (item['assertion_revision'] != expectation_checks.REVISION or
+                    item.get('assertions') != [expectation_checks.describe(s,tc_adaptive.expectations) for s in item['steps']]):
+                raise ValueError('검사 조건 또는 검사기 버전이 변경되었습니다. 새 계획 승인 후 저장하세요.')
             if item['ai_required'] and p.get('consent') is not True:
                 raise ValueError('이 버전은 실행 중 AI 화면 검사/복구를 사용합니다. AI 분석 동의가 필요합니다.')
             with m._test_lock:

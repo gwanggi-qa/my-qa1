@@ -9,7 +9,6 @@ import copy
 import hashlib
 import html as html_lib
 import importlib.util
-import ipaddress
 import io
 import json
 import os
@@ -222,15 +221,6 @@ MANUAL_QA_BLOCK_PATTERNS = [
     "\ud658\uacbd\uc124\uc815",
     "\uc124\uc815 \uc571",
     "\ubc31\uadf8\ub77c\uc6b4\ub4dc",
-]
-
-MANUAL_QA_VISUAL_ONLY_PATTERNS = [
-    "\ub85c\uace0",
-    "\uc2a4\ud50c\ub798\uc2dc",
-    "\uc774\ubbf8\uc9c0",
-    "\uc544\uc774\ucf58",
-    "\ubaa8\uc591",
-    "\uadf8\ub798\ud504",
 ]
 
 WORDP_HEADER_ALIASES = {
@@ -476,14 +466,6 @@ def should_block_manual_qa(depths, check_type, expected):
     for pattern in MANUAL_QA_BLOCK_PATTERNS:
         if pattern.lower() in text:
             return f"Manual QA row needs environment/device control: {pattern}"
-    return ""
-
-
-def should_block_visual_manual_qa(depths, expected):
-    text = " ".join([*depths, expected]).lower()
-    for pattern in MANUAL_QA_VISUAL_ONLY_PATTERNS:
-        if pattern.lower() in text:
-            return f"Visual-only QA row needs screenshot/OCR/template verification: {pattern}"
     return ""
 
 
@@ -1491,12 +1473,6 @@ def expected_candidates_from_step(step):
     return unique_text_candidates(candidates)[:12]
 
 
-def text_candidates_from_step(step):
-    candidates = target_candidates_from_step(step)
-    candidates.extend(expected_candidates_from_step(step))
-    return unique_text_candidates(candidates)
-
-
 def text_value_matches(candidate, value):
     candidate = str(candidate or "").strip()
     value = str(value or "").strip()
@@ -1615,27 +1591,6 @@ def allows_unchanged_after_tap(step, text_hit):
     description = str(step.get("description") or "")
     matched_text = str((text_hit or {}).get("text") or "")
     return any(value in description or matched_text == value for value in ["\\ub2e4\\uc74c", "\\uc774\\uc804", "Next", "Previous"])
-
-
-def ui_contains(text):
-    xml = dump_ui_xml()
-    if not xml:
-        return False
-    return text in xml
-
-
-def wait_until_ui_contains(text, timeout_s=5.0, should_exist=True):
-    deadline = time.time() + timeout_s
-    next_ocr_at = 0.0
-    while time.time() < deadline:
-        found = ui_contains(text)
-        if should_exist and not found and time.time() >= next_ocr_at:
-            found = find_ocr_text_center([text]) is not None
-            next_ocr_at = time.time() + 1.0
-        if found == should_exist:
-            return True
-        time.sleep(0.35)
-    return False
 
 
 def wait_until_any_ui_contains(candidates, timeout_s=5.0):
@@ -2518,25 +2473,6 @@ def ui_node_score(label, attrs, center):
         score -= 1
     return max(1, score)
 
-    score = 4
-    if label:
-        score += 3
-    if "Tab" in label:
-        score += 2
-    if re.search(r"Unit|?????|????????????????釉먮폁?????????????????????????ロ깫??????????筌띯뫔??????????????MY", label):
-        score += 3
-    if attrs.get("scrollable") == "true":
-        score += 2
-    if attrs.get("selected") == "true":
-        score -= 2
-    if attrs.get("enabled") == "false":
-        score -= 6
-    if center["area"] < 1600:
-        score -= 3
-    if not label and attrs.get("clickable") == "true":
-        score -= 1
-    return max(1, score)
-
 
 def analyze_ui_candidates():
     xml = dump_ui_xml()
@@ -2990,13 +2926,6 @@ def request_openai_json(instructions, context, max_output_tokens=2400, image_png
             raise AIRequestError('invalid_response')
         raise RuntimeError("OpenAI API returned no JSON output")
     return parse_openai_json(output_text), response_data.get("usage") or {}
-
-
-def parse_ai_plan_json(text):
-    data = parse_openai_json(text)
-    if not isinstance(data.get("steps"), list):
-        raise ValueError("AI planner response does not contain a steps list.")
-    return data
 
 
 def request_codex_random_json(instructions, context, metrics):
@@ -6101,7 +6030,6 @@ HTML = r"""
               <select id="tc-flow-library" aria-label="저장된 자동화 버전" style="min-width:0;flex:1"><option value="">저장 버전 선택</option></select>
               <button type="button" class="btn-secondary" id="tc-flow-load">불러오기</button>
               <button type="button" class="btn-secondary" id="tc-flow-code">코드 내보내기</button>
-              <button type="button" class="btn-secondary" id="tc-flow-refresh" title="저장 버전 새로고침">↻</button>
             </div>
           </section>
           <div class="test-resolution-state" id="test-resolution-state" hidden></div>

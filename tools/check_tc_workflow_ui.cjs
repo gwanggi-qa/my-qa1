@@ -7,7 +7,7 @@ const root=path.resolve(__dirname,'..');
 const source=fs.readFileSync(path.join(root,'mirror_server.py'),'utf8');
 let html=source.split('HTML = r"""')[1].split('"""')[0];
 html=html.replace('<head>','<head><meta name="qa-csrf-token" content="fixture"><script src="/static/local-request.js"></script>');
-html=html.replace(/<script src="https:\/\/cdn\.socket\.io[^>]*><\/script>/,'<script>window._socketEvents={};window.io=()=>({on(e,fn){window._socketEvents[e]=fn;if(e==="connect")setTimeout(fn,0);},emit(){}});</script>');
+html=html.replace(/<script src="(?:https:\/\/cdn\.socket\.io|\/static\/vendor\/socket\.io)[^>]*><\/script>/,'<script>window._socketEvents={};window.io=()=>({on(e,fn){window._socketEvents[e]=fn;if(e==="connect")setTimeout(fn,0);},emit(){}});</script>');
 html=html.replace('</body>','<script src="/execution-dashboard.js" defer></script><script src="/static/tc-workflow.js" defer></script></body>');
 const metadata={upload_id:'synthetic-upload',file_hash:'synthetic-hash',source:'narrative_qa'};
 const step={source:'narrative_qa',case_no:'DTC-001',sheet:'TestCase',row:2,title:'합성 설정 확인',precondition:'홈 표시',test_item:'설정 버튼을 클릭한다.',expected:'설정 화면이 표시된다',action:'blocked',ai_pending:true};
@@ -34,6 +34,8 @@ const view=()=>{if(flow?.state==='preparing'&&Date.now()>readyAt){flow.state='re
     if(u.pathname==='/api/tc-workflow/prepare'){
       calls.push(route.request().postDataJSON());
       flow={id:'synthetic-plan',state:'preparing',message:'AI 절차 분석 중',ai_mode:true,plan_digest:'digest',file_hash:metadata.file_hash,upload_id:metadata.upload_id,cases:[{index:1,case_no:step.case_no,title:step.title,precondition:step.precondition,procedures:[step.test_item],expected:step.expected,plan:{actions:[{procedure:1,action:'tap',target:'설정',basis:'procedure',source:step.test_item}],checks:[{expectation:1,after_action:1}],blocked_reason:''}}]};readyAt=Date.now()+1000;
+      flow.cases[0].assertions=[{expectation:1,source:'"설정" 탭이 선택된다.',method:'ui-assertion',conditions:[{selector:{text:'설정'},attribute:'selected',value:true}]},
+        {expectation:2,source:'설정 화면이 오른쪽에 표시된다.',method:'ai-visual',conditions:[]}];
       return route.fulfill({status:202,json:{workflow:flow}});
     }
     if(u.pathname==='/api/tc-workflow/current')return route.fulfill({json:{workflow:view()}});
@@ -61,6 +63,9 @@ const view=()=>{if(flow?.state==='preparing'&&Date.now()>readyAt){flow.state='re
     assert.equal(calls[0].ai_mode,true);
     assert.match(await page.locator('#tc-flow-cases').innerText(),/최대 5회/);
     assert.match(await page.locator('#tc-flow-cases').innerText(),/동작 1 직후 기대결과 1 검증/);
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/화면 속성 코드 검사/);
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/selected/);
+    assert.match(await page.locator('#tc-flow-cases').innerText(),/AI 시각 검증/);
     await page.locator('#tc-flow-plan').scrollIntoViewIfNeeded();
     await page.screenshot({path:path.join(root,'qa_results/tc-flow-desktop.png')});
     await page.reload({waitUntil:'networkidle'});
@@ -108,5 +113,5 @@ const view=()=>{if(flow?.state==='preparing'&&Date.now()>readyAt){flow.state='re
     await page.screenshot({path:path.join(root,'qa_results/tc-plan-errors-mobile.png')});
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({selection:true,consent:true,plan:true,reload:true,executionFlow:true,resetCancel:true,resetConfirm:true,newFailure:true,historyLinks:true,mobile:true,zeroExecutableDisabled:true,planningErrors:true,errors}));
-  }finally{await browser.close();}
+  }catch(e){console.error('Browser errors:',errors);throw e;}finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

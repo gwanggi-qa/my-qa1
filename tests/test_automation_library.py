@@ -22,6 +22,56 @@ class SavedWorkflowTests(fixtures.WorkflowTests):
         flow=self.prepare()
         self.assertEqual(self.call(flow.id+'/save',{'plan_digest':flow.digest}).status_code,409)
 
+    def test_state_assertion_saved_replayed_and_failure_evidence(self):
+        s=self.host._test_steps[0]
+        s.update(expected='"설정"이 선택된다.',qa_expected='"설정"이 선택된다.')
+        self.host.request_test_ai_json.return_value=({'plans':[fixtures.ai_plan(s)]}, {})
+        flow=self.prepare(ai=True)
+        self.assertEqual(flow.public()['cases'][0]['assertions'][0]['method'],'ui-assertion')
+        version=self.call(flow.id+'/save',{'approved':True,'plan_digest':flow.digest}).json['version']
+        store=automation_library.Library(self.host.QA_RESULTS_DIR/'automation_library')
+        item=store.read(version)
+        self.assertEqual(item['assertions'][0][0]['conditions'][0]['attribute'],'selected')
+        for selected, status in [('true','passed'),('false','failed')]:
+            self.assertEqual(self.call('library/'+version+'/load',{}).status_code,200)
+            driver=Mock()
+            driver.xml.return_value=self.host.dump_ui_xml.return_value.replace('clickable="true"',f'clickable="true" selected="{selected}"')
+            with patch('tc_workflow.prepared_appium.AppiumSession',return_value=driver):
+                result=self.start(self.service['current'])
+            self.assertEqual(result['counts'][status],1)
+            self.assertFalse(result['results'][0]['ai_assisted'])
+            evidence=[e for stage in result['results'][0]['stages'] for e in stage['evidence']]
+            self.assertTrue(any(e.get('method')=='ui-assertion' for e in evidence))
+
+    def test_missing_state_attribute_blocks_with_evidence(self):
+        s=self.host._test_steps[0]
+        s.update(expected='"설정"이 선택된다.',qa_expected='"설정"이 선택된다.')
+        flow=self.prepare(False)
+        self.assertFalse(flow.plans[0]['blocked_reason'])
+        result=self.start(flow)
+        self.assertEqual(result['counts']['blocked'],1)
+        self.assertTrue(any(e.get('unverified_reason') for e in result['results'][0]['verification']))
+        self.host.verify_visual_step.assert_not_called()
+
+    def test_assertion_revision_change_requires_reapproval(self):
+        version=self.saved()
+        with patch('expectation_checks.REVISION',999):
+            self.assertEqual(self.call('library/'+version+'/load',{}).status_code,409)
+
+    def test_uncompiled_condition_never_uses_legacy_presence_or_calls_ai(self):
+        version=self.saved()
+        self.assertEqual(self.call('library/'+version+'/load',{}).status_code,200)
+        flow=self.service['current']
+        s={**fixtures.step(),'_workflow_index':1}
+        with self.assertRaisesRegex(self.host.BlockedStep,'재승인'):
+            flow.check(s,'설정 카드가 오른쪽에 표시된다.')
+        flow.offline_checks=None
+        flow.ai_mode=False
+        with self.assertRaisesRegex(self.host.BlockedStep,'AI TC RUN'):
+            flow.check(s,'설정 카드가 오른쪽에 표시된다.')
+        self.host.dump_ui_xml.assert_not_called()
+        self.host.verify_visual_step.assert_not_called()
+
     def test_library_survives_service_reset_and_exports_safe_code(self):
         version=self.saved()
         self.service['current']=None

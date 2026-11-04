@@ -263,7 +263,7 @@ class AiTcTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 409)
                 self.assertIn("Another automation", response.json["error"])
                 denied = client.post(url, json={}, base_url="http://localhost:5000",
-                                     headers={"Origin": "http://localhost:5000"})
+                                     headers={"Origin": "http://localhost:5000", "X-QA-CSRF-Token": ""})
                 self.assertEqual(denied.status_code, 403)
                 self.assertEqual(denied.json["code"], "page_verification_required")
         thread.assert_not_called()

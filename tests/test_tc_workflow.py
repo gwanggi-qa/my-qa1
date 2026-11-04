@@ -205,6 +205,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.host.request_test_ai_json.call_count,1)
 
     def test_precondition_does_not_require_final_screen_labels(self):
+        self.host._test_steps[0].update(precondition='홈 화면이 열려 있다',
+                                      expected='설정 화면이 열려 있다',qa_expected='설정 화면이 열려 있다')
         self.host._test_steps[0]['required_labels']=['설정','정보']
         self.host.request_test_ai_json.return_value=({'plans':[ai_plan(self.host._test_steps[0])]}, {})
         self.host.verify_visual_step.side_effect=self.visual
@@ -248,16 +250,19 @@ class WorkflowTests(unittest.TestCase):
         result=self.start(flow)
         self.assertEqual(result['counts']['passed'],1)
         self.host.adb.assert_called_once_with('shell','input','tap','10','10',timeout_s=8)
-        self.assertEqual(self.host.verify_visual_step.call_args.args[0]['expected'],step()['expected'])
+        self.host.verify_visual_step.assert_not_called()
+        findings=[f for stage in result['results'][0]['stages'] for e in stage['evidence'] for f in e.get('findings',[])]
+        self.assertTrue(any(f['source']==step()['expected'] and f['passed'] for f in findings))
         self.assertEqual(len(result['results'][0]['stages']),4)
         self.assertEqual(result['results'][0]['input_count'],1)
 
     def test_partial_expected_is_not_pass_and_next_tc_continues(self):
         original=step()
+        original.update(expected='설정 카드가 오른쪽에 표시된다',qa_expected='설정 카드가 오른쪽에 표시된다')
         flow=w.Workflow(self.host,[original,{**original,'case_no':'DTC-002','row':3}],self.metadata,[1,2],True)
         flow.plans=[{'index':i,'actions':[action()],'blocked_reason':''} for i in (1,2)]
         def verify(probe):
-            if probe['expected']==step()['expected'] and probe['case_no']=='DTC-001':
+            if probe['expected']==original['expected'] and probe['case_no']=='DTC-001':
                 raise AssertionError('필수 기대결과 불충족')
             return self.visual(probe)
         self.host.verify_visual_step.side_effect=verify
@@ -482,11 +487,7 @@ class WorkflowTests(unittest.TestCase):
         p=self.modern(s,[{**action(),'basis':'procedure','source':s['test_item']}],
                       [{'expectation':1,'after_action':1}])
         self.host.request_test_ai_json.return_value=({'plans':[p]}, {})
-        def verify(probe):
-            if probe['expected']==s['expected']:
-                raise AssertionError('기대결과와 실제 화면 불일치')
-            return self.visual(probe)
-        self.host.verify_visual_step.side_effect=verify
+        self.host.dump_ui_xml.return_value='<hierarchy><node text="홈"/></hierarchy>'
         result=self.start(self.prepare(True))
         self.assertEqual(result['counts']['failed'],1)
         self.host.adb.assert_not_called()

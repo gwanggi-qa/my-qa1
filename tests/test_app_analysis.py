@@ -79,10 +79,16 @@ class AnalysisTests(unittest.TestCase):
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, 'w') as archive:
             archive.writestr('AndroidManifest.xml', b'x')
-            archive.writestr('androidmanifest.xml', b'x')
+            archive.writestr('AndroidManifest.xml', b'x')
         stream.seek(0)
         with self.assertRaises(a.AnalysisError):
             self.store.register(stream, 'duplicate.apk')
+
+    def test_case_distinct_android_resources_are_valid(self):
+        build, _ = self.store.register(apk({'AndroidManifest.xml': b'x',
+                                           'res/1D.png': b'upper',
+                                           'res/1d.png': b'lower'}), 'case-sensitive.apk')
+        self.assertEqual(build['filename'], 'case-sensitive.apk')
 
     def test_newer_schema_is_not_overwritten(self):
         with self.store.connect() as db:

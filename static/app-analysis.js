@@ -7,7 +7,7 @@
   let referenceBuild='',reference=null,referenceBusy=false,referenceSerial=0,imageUrl='';
   let deleteSelection='';
   $('build-delete').onclick=async()=>{if(!selected||busy||!confirm('이 빌드의 APK·분석 이력·참고자료·생성 TC를 영구 삭제할까요? 실행 결과와 증거는 보존합니다. 재등록해도 이전 자료는 복원되지 않습니다.'))return;busy=true;$('build-delete').disabled=true;try{await api('builds/'+selected,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});location.reload();}catch(e){message(e.message,true);busy=false;$('build-delete').disabled=false;}};
-  const kindNames={requirements:'기획서',design:'디자인',testcase:'기존 TC'};
+  const kindNames={requirements:'기획서',design:'디자인',testcase:'기존 TC',database:'DB',other:'기타'};
   const referenceStates={ready:'미리보기 준비됨',partial:'부분 추출 · 검토 필요',visual_only:'이미지 · 텍스트 미추출'};
   const warningNames={
     'Image registered; OCR and AI interpretation have not been performed.':'이미지 등록 완료 · OCR·AI 해석 미수행',
@@ -39,7 +39,8 @@
     const sha=selected,serial=++referenceSerial;
     try{const data=await api('builds/'+sha+'/references/'+id);if(sha!==selected||serial!==referenceSerial)return;
       reference=data.reference;const p=reference.preview;$('reference-name').textContent=reference.filename;
-      metadata('reference-meta',[['유형',kindNames[reference.kind]],['상태',referenceStates[p.status]],['SHA-256',reference.sha256],['등록 시각',new Date(reference.created_at).toLocaleString('ko-KR')],['원본 주소',reference.source_url||'-']]);
+      const extra=p.format==='database'?[['DB 형식',p.engine],['테이블 수',p.table_count],['학습 구성',p.curriculum?p.curriculum.levels.map(v=>v.level+'레벨 '+v.sessions+'단계').join(' · '):'미인식 · 테이블 구조만 분석']]:[];
+      metadata('reference-meta',[['유형',kindNames[reference.kind]],['상태',referenceStates[p.status]],...extra,['SHA-256',reference.sha256],['등록 시각',new Date(reference.created_at).toLocaleString('ko-KR')],['원본 주소',reference.source_url||'-']]);
       $('reference-warning').textContent=[...(p.warnings||[]),...(p.notes||[])].map(w=>warningNames[w]||w.replace(': preview limited to 200 rows / 30 columns / 200 merges.',': 앞 200행·30열·병합 범위 200개만 미리보기')).join('\n');
       $('reference-unit').replaceChildren();for(const [i,u]of (p.units||[]).entries()){const option=node('option',u.label);option.value=i;$('reference-unit').append(option);}
       $('reference-unit-label').hidden=!(p.units?.length);referenceUnit();
@@ -118,6 +119,8 @@
   for(const name of ['components','permissions'])$(name+'-tab').onclick=()=>{tab=name;for(const n of ['components','permissions'])$(n+'-tab').setAttribute('aria-selected',String(n===name));$('inventory').setAttribute('aria-labelledby',name+'-tab');inventory();};
   $('search').oninput=inventory;
   $('reference-unit').onchange=referenceUnit;
+  $('reference-kind').onchange=()=>{$('reference-file').accept=$('reference-kind').value==='database'?'.db,.sqlite,.sqlite3,.dat':'.xlsx,.pdf,.md,.txt,.png,.jpg,.jpeg,.db,.sqlite,.sqlite3,.dat';};
+  $('reference-file').onchange=()=>{if(/\.(db|sqlite|sqlite3|dat)$/i.test($('reference-file').files[0]?.name||''))$('reference-kind').value='database';};
   window.addEventListener('qa-refresh-references',e=>{if(selected)loadReferences(selected,e.detail?.id||'');});
   $('reference-form').onsubmit=async e=>{e.preventDefault();if(!selected||referenceBusy)return;const file=$('reference-file').files[0];if(!file)return;
     if(file.size>20*1024*1024){referenceMessage('20 MB 이하 파일을 선택하세요.',true);return;}
