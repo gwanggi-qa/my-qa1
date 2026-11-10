@@ -16,9 +16,11 @@ STATUS_CODES = {'passed': 'PASS', 'failed': 'FAIL', 'blocked': 'BLOCK',
                 'stopped': 'STOPPED', 'not_run': 'NOT RUN', 'not_applicable': 'N/A', 'unverified': 'UNVERIFIED'}
 
 
-def draft_row(case):
+def draft_row(case, *, apk_basic=False):
     notes = ('검토 승인된 AI 초안' if case.get('review_status') == 'approved' else 'AI 생성 TC · 미검토') + ' · 미실행\n' + '\n'.join(case['assumptions'])
     notes += '\n시나리오: ' + case['category'] + '\n근거: ' + ', '.join(case['source_ids'])
+    if apk_basic:
+        notes = notes.replace('AI 초안', 'APK 기본 초안', 1).replace('AI 생성 TC', 'APK 기본 TC', 1)
     return [case['id'], case['title'], case['priority'], *(case.get('depth'+str(i), '') for i in range(1,4)),
             case.get('test_type', ''), case['objective'], case['preconditions'],
             '\n'.join(f'{i}. {s}' for i,s in enumerate(case['steps'],1)),

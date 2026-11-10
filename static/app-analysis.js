@@ -40,6 +40,7 @@
     try{const data=await api('builds/'+sha+'/references/'+id);if(sha!==selected||serial!==referenceSerial)return;
       reference=data.reference;const p=reference.preview;$('reference-name').textContent=reference.filename;
       const extra=p.format==='database'?[['DB 형식',p.engine],['테이블 수',p.table_count],['학습 구성',p.curriculum?p.curriculum.levels.map(v=>v.level+'레벨 '+v.sessions+'단계').join(' · '):'미인식 · 테이블 구조만 분석']]:[];
+      if(p.format==='figma')extra.push(['범위',p.scope==='page'?'페이지 전체':'개별 프레임'],['버전',p.version],...(p.scope==='page'?[['페이지',p.page_name],['화면 수',p.screens.length],['연결 정보',p.flows.length+'개'],['이미지형 화면',p.screens.filter(s=>s.image_only).length+'개 · 내부 문구 미추출']]:[]));
       metadata('reference-meta',[['유형',kindNames[reference.kind]],['상태',referenceStates[p.status]],...extra,['SHA-256',reference.sha256],['등록 시각',new Date(reference.created_at).toLocaleString('ko-KR')],['원본 주소',reference.source_url||'-']]);
       $('reference-warning').textContent=[...(p.warnings||[]),...(p.notes||[])].map(w=>warningNames[w]||w.replace(': preview limited to 200 rows / 30 columns / 200 merges.',': 앞 200행·30열·병합 범위 200개만 미리보기')).join('\n');
       $('reference-unit').replaceChildren();for(const [i,u]of (p.units||[]).entries()){const option=node('option',u.label);option.value=i;$('reference-unit').append(option);}
@@ -81,6 +82,7 @@
       for(const [name,value]of [['클래스',r.class_count],['리소스',r.resource_count],['컴포넌트',r.components.length]]){const box=node('div','');box.className='metric';box.append(node('strong',value??'미확인'),node('span',name));$('metrics').append(box);}
       metadata('package-meta',[['패키지',r.package_name],['버전',r.version_name+' ('+r.version_code+')'],['SDK','min '+r.min_sdk+' / target '+r.target_sdk],['분석 엔진','REA '+r.rea_version+' / JADX '+(r.engine?.version||'미확인')],['근거','AndroidManifest.xml · '+r.manifest_status],['서명 검증','미수행']]);
     }
+    window.dispatchEvent(new CustomEvent('qa-apk-basic-ready',{detail:{sha:selected,ready:build?.sha256===selected&&status==='completed'&&!!r?.package_name}}));
     inventory();controls();
   }
   async function select(sha){

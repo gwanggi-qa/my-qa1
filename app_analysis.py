@@ -172,6 +172,11 @@ def sanitize_result(payload, build_hash):
     result = {'build_sha256': build_hash, 'provider': 'rea', 'rea_version': '6.4.0',
               'evidence_kind': 'static_declaration', 'observed_at': now(),
               'package_name': data['package_name'], 'components': components,
+              'launcher_components': [identifier(node.get(ns + 'name')) for node in application or []
+                  if node.tag in {'activity', 'activity-alias'} and identifier(node.get(ns + 'name'))
+                  and any(any(a.get(ns + 'name') == 'android.intent.action.MAIN' for a in f.findall('action'))
+                          and any(c.get(ns + 'name') == 'android.intent.category.LAUNCHER' for c in f.findall('category'))
+                          for f in node.findall('intent-filter'))],
               'permissions': sorted({identifier(p) for p in permissions if identifier(p)}),
               'limitations': list(LIMITATIONS), 'ai_used': False,
               'signature_verification': 'not_performed',

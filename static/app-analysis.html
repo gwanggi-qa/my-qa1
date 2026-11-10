@@ -35,7 +35,12 @@
       <section class="detail" aria-label="분석 상세">
         <div class="detail-heading"><h2 id="build-name">선택된 빌드 없음</h2><span id="job-status" class="badge">대기</span></div>
         <dl id="build-meta"></dl>
-        <div class="actions"><button id="analyze" type="button" disabled>정적 분석 시작</button><button id="stop" type="button" disabled>분석 중단</button></div>
+        <div class="actions"><button id="analyze" type="button" disabled>정적 분석 시작</button><button id="stop" type="button" disabled>분석 중단</button><button id="apk-basic-draft" type="button" disabled title="참고자료·AI 없이 정적 선언 기반 미실행 TC 생성">APK 기본 TC 생성</button></div>
+        <section id="apk-basic-panel" hidden aria-label="APK 기능별 생성 결과">
+          <p id="apk-basic-status" role="status" aria-live="polite"></p>
+          <details id="apk-basic-details" hidden><summary>생성 항목 · 미확인 후보 · 제외 사유</summary><pre id="apk-basic-report"></pre></details>
+          <button id="apk-basic-export" type="button" hidden>표준 Excel 다운로드</button>
+        </section>
         <p class="notice">정적 APK 분석: 기기 설치·실행·AI 호출 없음 · 분석 완료 ≠ 테스트 Pass</p>
         <section class="references" aria-labelledby="reference-title">
           <div class="result-heading"><h3 id="reference-title">참고자료</h3><span id="reference-count">0개</span></div>
@@ -48,7 +53,7 @@
           </form>
           <p class="reference-status" id="database-help">DB: SQLite 형식의 .db · .sqlite · .sqlite3 · .dat를 등록하면 테이블과 학습 구성을 분석합니다.</p>
           <form id="figma-form" class="integration-form">
-            <label>Figma 프레임 링크<input id="figma-url" type="url" maxlength="2048" placeholder="https://www.figma.com/design/…?node-id=…" required></label>
+            <label>Figma 페이지 / 프레임 링크<input id="figma-url" type="url" maxlength="2048" placeholder="https://www.figma.com/design/…?node-id=…" required></label>
             <button id="figma-import" type="submit" disabled>Figma에서 가져오기</button>
           </form>
           <p id="figma-status" class="reference-status" role="status">Figma 연결 확인 중</p>
@@ -65,12 +70,12 @@
           </div>
         </section>
         <section class="drafts" aria-labelledby="draft-title">
-          <div class="result-heading"><h3 id="draft-title">AI TC 초안</h3><span id="draft-provider" class="reference-status">AI 연결 확인 중</span></div>
+          <div class="result-heading"><h3 id="draft-title">참고자료 기반 AI TC 생성</h3><span id="draft-provider" class="reference-status">AI 연결 확인 중</span></div>
           <div class="actions"><span class="reference-status">표준 양식: TestCase · 1~3Depth · 수동/자동화 결과 분리</span><button id="draft-template" type="button">표준 TC 양식 다운로드</button></div>
           <div id="draft-sources" aria-label="생성에 사용할 자료"></div>
           <form id="draft-form">
             <label>생성 범위<input id="draft-scope" maxlength="500" placeholder="예: 1레벨 전부 학습하기 / 각 레벨별 학습하기" required></label>
-            <input id="draft-count" type="hidden" value="0">
+            <label>생성 단계<select id="draft-count"><option value="3">대표 TC 먼저 생성 (최대 3개)</option><option value="1">대표 TC 1개</option><option value="0">대표 TC 확인 후 전체 생성</option></select></label>
             <label class="check"><input id="draft-images" type="checkbox">선택 자료의 이미지 포함 (최대 4개)</label>
             <button id="draft-preview" type="submit" disabled>AI 입력 미리보기</button>
           </form>
@@ -108,6 +113,7 @@
           </div>
         </section>
         <div id="analysis-result" hidden>
+          <details><summary>APK 기술 상세 · 기능 검증 결과 아님</summary>
           <div id="metrics" class="metrics"></div>
           <dl id="package-meta"></dl>
           <div class="result-heading"><h3>선언 정보</h3><label class="search"><span class="sr-only">권한·컴포넌트 검색</span><input id="search" type="search" placeholder="이름 검색"></label></div>
@@ -116,6 +122,7 @@
             <button type="button" id="permissions-tab" role="tab" aria-selected="false" aria-controls="inventory">권한</button>
           </div>
           <div class="table-wrap" id="inventory" role="tabpanel" aria-labelledby="components-tab"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+          </details>
         </div>
         <section class="limits"><h3>미검증 사항</h3><ul><li>화면 동작·기능 정확성·비즈니스 요구사항</li><li>APK 서명·배포자 신뢰성</li><li>네이티브 코드·서버 응답·동적 로딩</li></ul></section>
       </section>

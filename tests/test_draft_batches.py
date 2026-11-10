@@ -13,6 +13,10 @@ import tc_drafts as d
 class BatchTests(DraftTests):
     # Inherited legacy tests also ensure historical generation remains readable.
     def setup_coverage(self, count=2):
+        pilot = self.generate()
+        for c in pilot['cases']:
+            pilot = self.service.review(self.sha, pilot['id'], c['id'],
+                {**{k: c[k] for k in d.FIELDS}, 'review_status': 'approved', 'revision': pilot['revision']})
         self.settings['count'] = 0
         self.calls = []
         def runner(instructions, context, metrics, schema, cancel, stop_type, image):

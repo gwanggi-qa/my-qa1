@@ -44,7 +44,7 @@ def describe(service, result):
                           'generated': len(result['cases'] or []),
                           'phase': 'coverage' if units is None else 'generation',
                           'remaining_seconds': (sum(durations)/len(durations)*remaining) if durations and remaining else None,
-                          'resumable': result['status'] in {'stopped', 'failed', 'interrupted'} and remaining != 0}
+                          'resumable': result['status'] in {'stopped', 'failed', 'interrupted'} and remaining != 0 and not state.get('material_stop')}
     active = state.get('active_seconds', 0)
     if result['status'] == 'running' and state.get('segment_started'):
         active += max(0, (datetime.now(timezone.utc)-datetime.fromisoformat(state['segment_started'])).total_seconds())
@@ -85,7 +85,8 @@ def run(service, job_id, context, cancel):
     def commit(terminal=False):
         metrics = {k: state[k] for k in ('usage', 'planner_calls')}
         metrics.update(timeout_seconds=None, request_timeout_seconds=600, error_code=code,
-                       response_received=bool(state['responses']), elapsed_seconds=state['active_seconds'])
+                       response_received=bool(state['responses']), elapsed_seconds=state['active_seconds'],
+                       material_stop=state.get('material_stop', False))
         original = {'summary': state['summary'], 'questions': state['questions'], 'cases': cases}
         with service.store.connect() as db:
             db.execute('UPDATE draft_checkpoints SET state_json=? WHERE job_id=?', (encoded(state), job_id))
@@ -185,7 +186,15 @@ def run(service, job_id, context, cancel):
                 state['questions'].extend(value['questions'])
                 state['next'] = index+1
                 state['durations'].append(time.monotonic()-started)
+                state['empty_streak'] = 0 if accepted else state.get('empty_streak', 0) + 1
+                if state['empty_streak'] >= 2:
+                    state['material_stop'] = True
+                    status = 'stopped'
+                    error = '2개 묶음 연속 TC 미생성으로 자동 중지했습니다. 자료·범위를 보완하고 대표 TC부터 다시 확인하세요.'
+                    state['questions'].append(error)
                 commit()
+            if state.get('material_stop'):
+                break
     except DraftStopped:
         status = 'stopped'
     except AIRequestError as exc:

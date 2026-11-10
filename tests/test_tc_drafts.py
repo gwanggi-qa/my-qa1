@@ -32,6 +32,100 @@ def runner(instructions, context, metrics, schema, cancel, stop_type, image):
     return result(context), {'input_tokens': 12, 'output_tokens': 30}
 
 
+class ApkBasicTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.store = a.AnalysisStore(Path(folder.name))
+        self.sha = self.store.register(apk(), 'test.apk')[0]['sha256']
+        self.app = Flask(__name__)
+        d.register_draft_routes(self.app, self.store, None)
+        self.app.register_error_handler(a.AnalysisError, lambda e: ({'error':str(e)}, e.status))
+        self.client = self.app.test_client()
+        self.url = '/api/app-analysis/builds/' + self.sha
+
+    def save_analysis(self, result, status='completed'):
+        with self.store.connect() as db:
+            db.execute('INSERT INTO jobs(id,build_sha256,status,started_at,result_json) VALUES (?,?,?,?,?)',
+                       ('analysis',self.sha,status,a.now(),json.dumps(result)))
+
+    def wait_basic(self):
+        import time
+        for _ in range(200):
+            draft=self.client.get(self.url+'/apk-basic-drafts').json['draft']
+            if draft['status']!='running':
+                return draft
+            time.sleep(.01)
+        self.fail('APK basic worker did not finish')
+
+    def test_registered_or_incomplete_is_not_enough(self):
+        self.assertEqual(self.client.post(self.url+'/apk-basic-drafts').status_code,409)
+        self.save_analysis({}, 'failed')
+        self.assertEqual(self.client.post(self.url+'/apk-basic-drafts').status_code,409)
+        self.assertEqual(self.client.get(self.url+'/drafts').json['drafts'],[])
+
+    def test_local_generation_and_export_without_references_or_ai(self):
+        from test_app_analysis import payload
+        manifest = ('<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="qa.example">'
+                    '<application><activity-alias android:name=".Icon"><intent-filter>'
+                    '<action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/>'
+                    '</intent-filter></activity-alias></application></manifest>')
+        raw = payload(manifest=manifest)
+        raw['normalized_result']['version_code'] = 7
+        self.save_analysis(a.sanitize_result(raw,self.sha))
+        response = self.client.post(self.url+'/apk-basic-drafts')
+        self.assertIn(response.status_code,(200,202))
+        draft = self.wait_basic()
+        self.assertEqual(self.client.post(self.url+'/apk-basic-drafts').json['draft']['id'],draft['id'])
+        self.assertEqual([c['id'] for c in draft['cases']],['DTC-001','DTC-002','DTC-003'])
+        self.assertEqual(draft['metrics']['planner_calls'],0)
+        url = self.url+'/drafts/'+draft['id']
+        self.assertEqual(self.client.get(url).json['draft']['cases'],draft['cases'])
+        book = load_workbook(io.BytesIO(self.client.get(url+'/export').data))
+        self.addCleanup(book.close)
+        sheet = book['TestCase']
+        self.assertEqual([c.value for c in sheet[1]],list(d.tc_format.HEADERS))
+        for row in list(sheet.values)[1:]:
+            self.assertTrue(all(row[i] for i in (0,1,2,7,8,9,10)))
+            self.assertEqual(row[11:13],(None,None))
+            self.assertIn('미실행',row[13])
+        self.assertEqual(book['Sources']['H2'].value,self.sha)
+        case=draft['cases'][0]
+        edit={k:case[k] for k in d.FIELDS}
+        edit.update(title='검토자가 수정한 제목',review_status='approved',revision=0)
+        self.assertEqual(self.client.patch(url+'/cases/'+case['id'],json=edit).status_code,200)
+        cached=self.client.post(self.url+'/apk-basic-drafts').json['draft']
+        self.assertEqual(cached['cases'][0]['title'],edit['title'])
+        self.assertEqual(cached['revision'],1)
+
+    def test_legacy_analysis_only_produces_supported_checks(self):
+        self.save_analysis({'package_name':'qa.example','version_code':'not_retained','build_sha256':self.sha,
+                            'components':[{'type':'activity','name':'.QuizActivity'}]})
+        self.client.post(self.url+'/apk-basic-drafts')
+        draft = self.wait_basic()
+        self.assertEqual([c['title'] for c in draft['cases']],['설치 패키지 식별'])
+        self.assertTrue(draft['original']['questions'])
+
+    def test_resource_failure_distinct_from_zero_and_duplicate_click(self):
+        self.save_analysis({'package_name':'qa.example','build_sha256':self.sha})
+        started,release=threading.Event(),threading.Event()
+        def fail(*args):
+            started.set()
+            release.wait(3)
+            raise a.AnalysisError('분석 오류: aapt2 실패',422)
+        with patch('apk_features.extract',side_effect=fail) as extract:
+            first=self.client.post(self.url+'/apk-basic-drafts').json['draft']
+            self.assertTrue(started.wait(2))
+            self.assertEqual(self.client.post(self.url+'/apk-basic-drafts').json['draft']['id'],first['id'])
+            release.set()
+            self.assertEqual(self.wait_basic()['status'],'failed')
+            self.assertEqual(extract.call_count,1)
+        self.client.post(self.url+'/apk-basic-drafts')
+        new=self.wait_basic()
+        self.assertEqual(new['status'],'completed')
+        self.assertEqual(new['context']['coverage_report']['features'],0)
+
+
 class DraftTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

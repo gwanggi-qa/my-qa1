@@ -5,8 +5,10 @@
   const fields=['title','objective','preconditions','steps','expected_results','priority','depth1','depth2','depth3','test_type','category','source_ids','assumptions'];
   const states={running:'생성 중',completed:'초안 생성 완료 · 미실행',failed:'생성 실패',stopped:'생성 중단',interrupted:'서버 재시작으로 중단'};
   const reviews={draft:'생성 완료·미검토',approved:'검토 승인',rejected:'제외'};
+  const resultLabel=d=>d.outcome==='no_cases'?'TC 미생성 · 자료 보완 필요':d.outcome==='material_stop'?'반복 미생성 · 자동 중지':(states[d.status]||d.status);
   let sha='',epoch=0,prepared=null,batch=null,caseId='',busy=false,figmaBusy=false,timer=null,dirty=false;
   let integrations={figma:{configured:false},ai:{configured:false}},imageUrls=[],sourceKey='';
+  let basicReady=false,basicRunning=false,basicSerial=0,basicTimer=null,basicSha='';
   let clock=null,elapsedAt=0,elapsedBase=0,stoppingId='',pollDelayed=false,loadVersion=0;
   const errors={timeout:'시간 초과',authentication:'인증 필요',usage_limit:'사용량 한도',connection:'연결 오류',invalid_response:'응답 형식 오류',cli_execution:'CLI 실행 오류',unknown:'기타 오류'};
   const duration=seconds=>{const n=Math.max(0,Math.floor(seconds));return String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');};
@@ -19,17 +21,18 @@
     elapsedBase=Number.isFinite(batch.elapsed_seconds)?batch.elapsed_seconds:Math.max(0,((batch.finished_at?Date.parse(batch.finished_at):Date.now())-Date.parse(batch.created_at))/1000);
     if(!Number.isFinite(elapsedBase))return;elapsedAt=performance.now();tick();if(batch.status==='running')clock=setInterval(tick,1000);}
   function batchMessage(){if(!batch)return;const running=batch.status==='running',metrics=batch.metrics||{};
-    let label=running&&(batch.stopping||stoppingId===batch.id)?'중단 처리 중':(states[batch.status]||batch.status);
+    let label=running&&(batch.stopping||stoppingId===batch.id)?'중단 처리 중':(batch.outcome==='no_cases'?'TC 미생성 · 자료 보완 필요':batch.outcome==='material_stop'?'반복 미생성 · 자동 중지':(states[batch.status]||batch.status));
     if(batch.status==='failed')label+=' ['+(errors[batch.error_code]||'원인 미분류')+']';
     if(batch.error)label+=' · '+batch.error;
     if(batch.progress){const p=batch.progress;label+=' · '+(p.total===null?'검증 범위 분석 중':p.completed+'/'+p.total+'묶음')+' · '+p.generated+'개 저장';if(p.needs_material)label+=' · '+p.needs_material+'묶음 TC 없음 · 자료 보완 필요';}
     label+=running?' · AI 응답 대기':' · AI 요청 '+(metrics.planner_calls||0)+'회';
-    if(!running)label+=metrics.usage&&Object.keys(metrics.usage).length?' · 토큰 '+JSON.stringify(metrics.usage):' · 사용량 확인 불가';
+    if(!running)label+=batch.context?.generation_policy==='apk-basic-v1'?' · 로컬 생성 · 토큰 미사용':metrics.usage&&Object.keys(metrics.usage).length?' · 토큰 '+JSON.stringify(metrics.usage):' · 사용량 확인 불가';
     if(pollDelayed)label+=' · 상태 확인 지연';message(label,batch.status==='failed'||pollDelayed);}
   function message(text,error=false){$('draft-message').textContent=text;$('draft-message').classList.toggle('error',error);}
   async function api(path,options={}){const res=await fetch('/api/app-analysis/'+path,options);const data=await res.json();if(!res.ok)throw Error(data.error||'요청 실패');return data;}
   const post=body=>({method:'POST',body:JSON.stringify(body),headers:{'Content-Type':'application/json'}});
   function controls(){const running=batch?.status==='running';$('figma-import').disabled=!sha||figmaBusy||!integrations.figma.configured;
+    $('apk-basic-draft').disabled=!sha||!basicReady||busy||running||basicRunning;
     for(const id of ['draft-scope','draft-count','draft-images'])$(id).disabled=busy||running;
     document.querySelectorAll('#draft-sources input').forEach(input=>input.disabled=busy||running);
     for(const key of fields)$('case-'+key).disabled=busy;
@@ -47,18 +50,50 @@
     $('case-review-status').value=c.review_status;
     $('case-evidence').textContent=batch.context.evidence.filter(e=>c.source_ids.includes(e.id)).map(e=>e.id+' · '+e.locator+'\n'+e.text).join('\n\n');dirty=false;controls();}
   function renderBatch(){const running=batch?.status==='running';$('draft-review').hidden=!batch?.cases?.length;
+    if(batch){const op=[...$('draft-history').options].find(o=>o.value===batch.id);if(op)op.textContent=new Date(batch.created_at).toLocaleString('ko-KR')+' · '+resultLabel(batch);}
     syncClock();if(batch){batchMessage();
       $('draft-summary').textContent=batch.original?.summary||'';$('draft-questions').textContent=(batch.original?.questions||[]).join('\n');$('draft-original').textContent=JSON.stringify(batch.original,null,2);if(!running)caseOptions();}
     controls();}
   async function loadBatch(id){const e=epoch,current=sha,version=++loadVersion;clearTimeout(timer);try{const data=await api('builds/'+current+'/drafts/'+id);if(e!==epoch||version!==loadVersion)return;batch=data.draft;pollDelayed=false;if(batch.status!=='running')stoppingId='';renderBatch();if(batch.status==='running')timer=setTimeout(()=>loadBatch(id),1500);}catch(err){if(e===epoch&&version===loadVersion){pollDelayed=true;if(batch?.id===id)batchMessage();else message('상태 확인 지연 · '+err.message,true);timer=setTimeout(()=>loadBatch(id),5000);}}}
   async function history(preferred=''){const e=epoch,current=sha;if(!sha)return;const data=await api('builds/'+sha+'/drafts');if(e!==epoch)return;
-    $('draft-history').replaceChildren();for(const d of data.drafts){const op=node('option',new Date(d.created_at).toLocaleString('ko-KR')+' · '+(states[d.status]||d.status));op.value=d.id;$('draft-history').append(op);}
+    $('draft-history').replaceChildren();for(const d of data.drafts){const op=node('option',new Date(d.created_at).toLocaleString('ko-KR')+' · '+resultLabel(d));op.value=d.id;$('draft-history').append(op);}
     const id=data.drafts.some(d=>d.id===preferred)?preferred:data.drafts[0]?.id;if(id){$('draft-history').value=id;await loadBatch(id);}else{$('draft-history').append(node('option','생성 이력 없음'));batch=null;renderBatch();}}
   window.addEventListener('qa-build-selected',e=>{if(sha===e.detail.sha)return;sha=e.detail.sha;++epoch;clearTimeout(timer);clearClock();stoppingId='';pollDelayed=false;batch=null;caseId='';dirty=false;sourceKey='';$('draft-sources').replaceChildren();$('draft-review').hidden=true;invalidate();message('초안 검토 대기 · 미실행');history().catch(err=>message(err.message,true));});
   window.addEventListener('qa-references-updated',e=>{if(sha!==e.detail.sha)return;const key=JSON.stringify(e.detail.references.map(r=>[r.id,r.sha256]));if(key===sourceKey)return;sourceKey=key;
     const old=new Set(selection().reference_ids);$('draft-sources').replaceChildren();for(const r of e.detail.references){const label=node('label','');label.className='check';const input=document.createElement('input');input.type='checkbox';input.value=r.id;input.checked=old.has(r.id);input.onchange=invalidate;label.append(input,node('span',r.filename+' · '+({requirements:'기획서',design:'디자인',testcase:'기존 TC',database:'DB',other:'기타'}[r.kind]||r.kind)+(r.status==='ready'?'':' · 부분 자료')));$('draft-sources').append(label);}invalidate();});
-  $('figma-form').onsubmit=async e=>{e.preventDefault();if(!sha||figmaBusy)return;const current=sha;figmaBusy=true;controls();$('figma-status').textContent='Figma 프레임 읽는 중';
-    try{const data=await api('builds/'+current+'/figma',post({url:$('figma-url').value}));if(current===sha){$('figma-status').textContent=data.duplicate?'동일한 버전이 등록되어 있습니다.':'프레임 가져오기 완료 · '+data.reference.preview.version;window.dispatchEvent(new CustomEvent('qa-refresh-references',{detail:{id:data.reference.id}}));}}
+  function renderBasic(d){
+    $('apk-basic-panel').hidden=!d;
+    const report=d?.context?.coverage_report;
+    $('apk-basic-details').hidden=!report;$('apk-basic-export').hidden=!report;
+    if(!d)return;
+    if(!report){$('apk-basic-status').textContent=d.error||d.metrics?.phase||states[d.status];return;}
+    const count=d.cases.filter(c=>c.review_status!=='rejected').length;
+    $('apk-basic-status').textContent='TC 저장 완료 · 기능 후보 '+report.candidates+'개 · 생성 '+(report.base+report.features)+'개 (기본 점검 '+report.base+' / 기능 '+report.features+') · 미확인 후보 '+report.pending.length+'개 · Excel 대상 '+count+'개';
+    $('apk-basic-report').textContent=['생성된 TC (화면 진입 경로는 실기기 확인 필요)',...d.cases.map(c=>c.id+' · '+c.title),
+      '', '기기 확인 필요',...report.pending,'','제외 사유',...Object.entries(report.excluded).map(([s,n])=>s+' · '+n+'개')].join('\n');
+    $('apk-basic-export').hidden=!count;
+    $('apk-basic-export').dataset.draftId=d.id;
+  }
+  async function basicRequest(create=false){
+    const serial=++basicSerial,current=sha;clearTimeout(basicTimer);
+    if(create){basicRunning=true;renderBasic({metrics:{phase:'APK 리소스 분석 중'}});controls();}
+    try{
+      const {draft}=await api('builds/'+current+'/apk-basic-drafts',create?post({}):{});
+      if(serial!==basicSerial||sha!==current)return;
+      const wasRunning=basicRunning;basicRunning=draft?.status==='running';renderBasic(draft);
+      if(basicRunning)basicTimer=setTimeout(()=>basicRequest(),1000);
+      else if((create||wasRunning)&&draft?.status==='completed')await history(draft.id);
+    }catch(err){if(serial===basicSerial){basicRunning=false;renderBasic({error:'상태 확인 오류 · '+err.message});}}
+    finally{if(serial===basicSerial)controls();}
+  }
+  window.addEventListener('qa-build-selected',e=>{if(basicSha!==e.detail.sha){++basicSerial;clearTimeout(basicTimer);basicSha='';basicReady=basicRunning=false;renderBasic(null);controls();}});
+  window.addEventListener('qa-apk-basic-ready',e=>{if(sha===e.detail.sha){basicReady=e.detail.ready;
+    if(basicReady&&basicSha!==sha){basicSha=sha;basicRequest();}controls();}});
+  $('apk-basic-draft').onclick=async()=>{if(!basicReady||busy)return;
+    if(dirty&&!confirm('저장하지 않은 검토 내용을 버리고 기본 TC를 생성할까요?'))return;
+    if(!basicRunning)await basicRequest(true);};
+  $('figma-form').onsubmit=async e=>{e.preventDefault();if(!sha||figmaBusy)return;const current=sha;figmaBusy=true;controls();$('figma-status').textContent='Figma 페이지·화면 구성 읽는 중';
+    try{const data=await api('builds/'+current+'/figma',post({url:$('figma-url').value}));if(current===sha){const p=data.reference.preview;$('figma-status').textContent=(data.duplicate?'동일한 버전이 등록되어 있습니다.':(p.scope==='page'?'페이지 가져오기 완료 · '+p.screens.length+'개 화면 · '+p.flows.length+'개 연결':'프레임 가져오기 완료'))+' · '+p.version+(p.status==='partial'?' · 부분 추출: 미리보기의 확인 필요 사항을 검토하세요.':'');window.dispatchEvent(new CustomEvent('qa-refresh-references',{detail:{id:data.reference.id}}));}}
     catch(err){$('figma-status').textContent=err.message;}finally{figmaBusy=false;controls();}};
   for(const id of ['draft-scope','draft-count','draft-images'])$(id).addEventListener('input',invalidate);
   $('draft-consent').onchange=controls;
@@ -81,7 +116,18 @@
   $('draft-case-form').onsubmit=async e=>{e.preventDefault();if(!batch||busy)return;const current=sha,serial=epoch;const payload={revision:batch.revision,review_status:$('case-review-status').value};
     for(const key of fields){const value=$('case-'+key).value;payload[key]=['steps','expected_results','assumptions','source_ids'].includes(key)?value.split(key==='source_ids'?',':'\n').map(s=>s.trim()).filter(Boolean):value;}
     busy=true;controls();try{const data=await api('builds/'+current+'/drafts/'+batch.id+'/cases/'+caseId,{...post(payload),method:'PATCH'});if(serial!==epoch)return;batch=data.draft;renderBatch();message('검토 저장 완료 · 실행은 수행하지 않았습니다.');}catch(err){message(err.message,true);}finally{busy=false;controls();}};
-  $('draft-export').onclick=async()=>{if(!batch||busy)return;busy=true;controls();try{const res=await fetch('/api/app-analysis/builds/'+sha+'/drafts/'+batch.id+'/export');if(!res.ok)throw Error((await res.json()).error);const url=URL.createObjectURL(await res.blob()),link=document.createElement('a');link.href=url;link.download='reviewed-testcases.xlsx';link.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}catch(err){message(err.message,true);}finally{busy=false;controls();}};
+  async function downloadDraft(id,filename){
+    const res=await fetch('/api/app-analysis/builds/'+sha+'/drafts/'+id+'/export');
+    if(!res.ok)throw Error((await res.json().catch(()=>({}))).error||'Excel 다운로드 실패 ('+res.status+')');
+    if(!res.headers.get('Content-Type')?.includes('spreadsheetml.sheet'))throw Error('Excel 파일이 아닌 응답을 받았습니다.');
+    const url=URL.createObjectURL(await res.blob()),link=document.createElement('a');
+    link.href=url;link.download=filename;link.click();setTimeout(()=>URL.revokeObjectURL(url),10000);
+  }
+  $('apk-basic-export').onclick=async()=>{const btn=$('apk-basic-export');btn.disabled=true;
+    try{await downloadDraft(btn.dataset.draftId,'APK기능TC-'+btn.dataset.draftId+'.xlsx');}
+    catch(err){$('apk-basic-status').textContent='다운로드 실패 · '+err.message;}
+    finally{btn.disabled=false;}};
+  $('draft-export').onclick=async()=>{if(!batch||busy)return;busy=true;controls();try{await downloadDraft(batch.id,'reviewed-testcases.xlsx');}catch(err){message(err.message,true);}finally{busy=false;controls();}};
   $('draft-template').onclick=async()=>{const button=$('draft-template');button.disabled=true;try{const res=await fetch('/api/app-analysis/testcase-template');if(!res.ok)throw Error('표준 양식 다운로드 실패');const url=URL.createObjectURL(await res.blob()),a=document.createElement('a');a.href=url;a.download='testcase-template.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}catch(e){message(e.message,true);}finally{button.disabled=false;}};
   $('refresh').addEventListener('click',()=>{connection();if(!dirty)history(batch?.id).catch(err=>message(err.message,true));});
   window.addEventListener('pagehide',()=>{++epoch;clearTimeout(timer);clearClock();imageUrls.forEach(URL.revokeObjectURL);});

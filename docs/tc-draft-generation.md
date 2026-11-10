@@ -2,14 +2,43 @@
 
 ## Scope and contract
 
+Generation now defaults to a representative draft of up to three cases (one AI
+request), not the entire DB curriculum. With a level scope, only the first 1-3
+sessions enter the representative context. Full generation (`count=0`) requires
+a nonempty representative result with at least one approved case and every other
+case approved or rejected, from the current generation policy
+with the same build, source hashes, scope, image selection and provider. The user
+reviews it and explicitly selects full generation; no automatic expansion occurs.
+Two consecutive empty/duplicate-only batches stop the full job and disable resume
+of the unchanged snapshot. Saved cases and past results remain intact.
+`outcome=no_cases` distinguishes an empty response from successful generation,
+including old completed jobs without altering their historical status.
+APK/DB evidence may support narrow implementation-baseline content tests; unknown
+navigation is preparation, not a fabricated action. Completion, unlock, scoring,
+and other unspecified rules must not be invented to increase generated counts.
+
 No APK/device installation, TC execution, or automatic approval. Notion continues
-to use file exports. Figma REST reads only one explicitly linked frame using the
+to use file exports. Figma REST reads an explicitly linked page (CANVAS) or frame using the
 server's FIGMA_ACCESS_TOKEN with file_content:read permission. No key is accepted
 from or returned to browsers. Figma MCP in Codex is not the web server credential.
 
 - GET /api/app-analysis/integrations: Figma configuration and AI provider status.
 - POST /builds/<sha>/figma (under /api/app-analysis): {url}; linked node required.
   Import normalized node metadata and optional PNG as a design reference snapshot.
+  Page snapshots retain the screen index, readable text, parent/bounds, prototype
+  starting points and navigation destinations. Destinations outside the page are
+  identified, not fetched. Canvas position/layer order is not learning order.
+  Image-only screens and absent prototype links produce partial-extraction warnings.
+  A page PNG is a reduced overview, not a legible screenshot of every screen.
+  No OCR or automatic AI analysis occurs on import. Detailed screenshot-only
+  content still needs individual frames/images or accompanying requirements.
+  Existing frame imports and stored references are retained unchanged.
+  Safety bounds remain: 8 MiB API response, 20,000 nodes, depth 40, 1,000,000
+  text characters for pages, existing reference storage caps and pinned image version.
+  Truncation is explicit. Page evidence prioritizes the screen index and flows,
+  then readable nodes, within a shared 240,000-character / 4,000-evidence budget.
+  Other references retain their bounded budget. Review the AI input warnings;
+  incomplete extraction must not be presented as complete test coverage.
 - POST /builds/<sha>/draft-context: {reference_ids, scope, count, include_images}.
   Return redacted bounded context, context_hash, provider, warnings and image IDs.
 - POST /builds/<sha>/drafts: same fields plus context_hash and consent:true.
@@ -136,3 +165,12 @@ detection and automatic TC registration/execution are outside this phase.
 - The operating server was updated after preserving idle state and backing up
   SQLite. Existing reference uploads and 1340x800 mirror frames passed regression.
 - No code commit/push, device automation, or production AI generation was performed.
+### APK만으로 기본 TC 생성
+
+등록한 APK의 정적 분석이 완료되면 빌드 상세에서 **APK 기본 TC 생성**을 선택합니다.
+참고자료나 AI 전송 없이 기존 APK를 로컬 Android SDK Build Tools의 aapt2로 읽습니다.
+버튼 아래에 진행 상태, 기본 점검과 기능 TC 수, 미확인 후보, 제외 이유 및 표준 Excel 다운로드가 표시됩니다.
+레이아웃·메뉴에서 실제로 연결된 문구와 접근성 이름을 초기 표시 기준으로 사용합니다. 화면 선언만으로
+진입 경로나 클릭 후 동작을 추정하지 않습니다. WebView·동적 화면은 실기기 확인이 필요합니다.
+같은 빌드 해시·생성 규칙 버전의 기존 초안(검토자가 수정한 버전 포함)을 재사용하며, 과거 이력은 유지합니다.
+기본 설치 점검과 화면 표시 TC 모두 미실행입니다. 화면 전환·학습 내용 등 기획 기준은 별도의 참고자료 기반 AI 생성에서 다룹니다.

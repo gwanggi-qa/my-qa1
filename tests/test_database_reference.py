@@ -107,6 +107,18 @@ class DatabaseTests(unittest.TestCase):
             output['cases'][0]['title'] = context['coverage_unit']['title']
             return output,{}
         service = drafts.DraftService(self.store,self.refs,runner,lambda:dict(configured=True,provider='fixture',model='fixture'))
+        pilot_settings = {**self.settings, 'count': 1}
+        original_runner = service.runner
+        service.runner = lambda instructions, context, *args: (result(context), {})
+        _, pilot_hash, _ = service.context(self.sha, pilot_settings)
+        pilot = service.start(self.sha, {**pilot_settings, 'context_hash': pilot_hash, 'consent': True})
+        service.worker.join(5)
+        self.assertEqual(len(service.get(self.sha, pilot['id'])['cases']), 1)
+        pilot = service.get(self.sha, pilot['id'])
+        c = pilot['cases'][0]
+        service.review(self.sha, pilot['id'], c['id'],
+                       {**{k: c[k] for k in drafts.FIELDS}, 'review_status': 'approved', 'revision': 0})
+        service.runner = original_runner
         _, fingerprint, _ = service.context(self.sha,self.settings)
         batch = service.start(self.sha,{**self.settings,'context_hash':fingerprint,'consent':True})
         service.worker.join(5)

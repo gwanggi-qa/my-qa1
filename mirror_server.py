@@ -988,7 +988,8 @@ def parse_excel(file_storage, mapping=None):
 
     narrative = narrative_excel.detect(wb)
     if narrative is not None:
-        return narrative_excel.parse(wb, narrative)
+        from apk_display_route import bind
+        return bind(wb,narrative_excel.parse(wb,narrative))
 
     manual_qa_steps = parse_manual_qa_excel(wb)
     if manual_qa_steps is not None:

@@ -15,6 +15,7 @@ import verified_execution
 import automation_library
 import prepared_appium
 import expectation_checks
+import apk_display_route
 from ai_request_errors import AIRequestError, ERRORS
 
 ACTION = ai_tc.obj({'procedure': {'type': 'integer'},
@@ -68,6 +69,8 @@ def result_note(case, step):
     supplements = [s.get('actual', '') for s in case.get('stages', []) if s.get('supplemental')]
     if supplements:
         parts.append('보완 동작: '+'; '.join(supplements))
+    if step.get('_display_actual'):
+        parts.append(step['_display_actual'])
     return '\n'.join(p for p in parts if p)
 
 
@@ -339,7 +342,17 @@ class Workflow:
         m._test_ai_context.metrics = {'planner_calls':0,'responses':0,'usage':{}}
         try:
             plans = {}
+            if self.ai_mode and any(s.get('_display_spec') for s in self.steps):
+                build=apk_display_route.installed_build(m)
+                for i,s in enumerate(self.steps,1):
+                    if s.get('_display_spec'):
+                        s['_display_build']=build
+                        s['_scope_note']=apk_display_route.scope(build)
+                        if build not in ('7','8'):
+                            plans[i]={'index':i,'actions':[],'blocked_reason':'승인 가능 빌드 7 또는 8이 필요합니다.'}
+                            self.planning[i]['status']='blocked'
             for i,s in enumerate(self.steps,1):
+                if i in plans:continue
                 measured = tc_lifecycle.plan(s, i) if self.ai_mode else None
                 if measured:
                     plans[i] = measured
@@ -385,6 +398,9 @@ class Workflow:
 
     def check(self, step, expected, precondition=False):
         self.guard()
+        if self.ai_mode and step.get('_display_spec') and not precondition and expected==step.get('qa_expected') and self.engine=='adb':
+            observation=apk_display_route.check(self,step)
+            if observation is not None:return observation
         if not expected.strip():
             return '명시된 사전조건 없음', []
         compiled = expectation_checks.compile_text(expected)
@@ -454,6 +470,8 @@ class Workflow:
     def navigate(self, step, goal, case, precondition=False):
         """Resolve a source goal against fresh screen candidates, never guessed coordinates."""
         m = self.host
+        if precondition and step.get('_display_spec') and self.engine=='adb':
+            return apk_display_route.navigate(self,step,case)
         if self.offline_checks is not None:
             return self.check(step,goal,precondition)
         while True:
