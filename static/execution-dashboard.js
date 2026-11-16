@@ -134,6 +134,7 @@ const haltActions=[
  ['TC 중단','test_running','/api/run/stop','btn-test-stop'],
  ['Random 중단','random_running','/api/random/stop','btn-random-stop'],
  ['재생 중단','record_play_running','/api/recordings/play/stop','btn-record-play-stop'],
+ ['음성 검사 중단','speech_running','/api/speech-verification/stop','btn-speech-stop'],
  ['녹화 중지',null,null,'btn-record-stop']
 ];
 for(const [label,key,url,originalId] of haltActions){
@@ -152,7 +153,7 @@ function syncRuntime(){
  const connection=document.getElementById('device-state')?.textContent||'확인 중';
  runtimeStatus.textContent='기기: '+connection+' · '+(runtime?
    'TC '+(runtime.test_running?'실행 중':'대기')+' · Random '+(runtime.random_running?'실행 중':'대기')+
-   ' · 재생 '+(runtime.record_play_running?'실행 중':'대기')+' · 미러링 '+(runtime.streaming?'켜짐':'꺼짐'):
+   ' · 재생 '+(runtime.record_play_running?'실행 중':'대기')+' · 음성 검사 '+(runtime.speech_running?'실행 중':'대기')+' · 미러링 '+(runtime.streaming?'켜짐':'꺼짐'):
    '서버 상태 확인 중')+' · 녹화 '+(recording?'진행 중':'대기');
  for(const [,key,,originalId] of haltActions){
    const original=document.getElementById(originalId);

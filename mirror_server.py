@@ -97,6 +97,7 @@ _reviewed_plan = None
 _verified_run = None
 _stop_generation = 0
 _test_running = False
+_speech_running = False
 _test_stop_event = threading.Event()
 _random_lock = threading.Lock()
 _random_running = False
@@ -3717,7 +3718,7 @@ class RecordingStopped(RuntimeError):
 
 
 def run_manual_input(payload, *, owner=None):
-    if owner is None and (_test_running or _random_running or _record_play_running):
+    if _speech_running or (owner is None and (_test_running or _random_running or _record_play_running)):
         raise RuntimeError("Manual input is unavailable while automation owns the device")
     input_type = str(payload.get("type") or "").strip().lower()
     if input_type not in {"tap", "swipe", "long_press", "keyevent"}:
@@ -3751,9 +3752,9 @@ def run_manual_input(payload, *, owner=None):
             if owner == "recorder":
                 if _record_play_stop_event.is_set():
                     raise RecordingStopped("Recorder playback stopped before input")
-                if not _record_play_running or _test_running or _random_running:
+                if not _record_play_running or _test_running or _random_running or _speech_running:
                     raise RuntimeError("Recorder does not own device input")
-            elif owner is not None or _test_running or _random_running or _record_play_running:
+            elif owner is not None or _test_running or _random_running or _record_play_running or _speech_running:
                 raise RuntimeError("Manual input is unavailable while automation owns the device")
             _, err, rc = adb(*args, timeout_s=8)
     if rc:
@@ -5946,6 +5947,7 @@ HTML = r"""
     </nav>
     <a href="/app-analysis" id="apk-analysis-link" style="color:#9de6d3;white-space:nowrap;padding:8px">APK 분석</a>
     <a href="/audio-verification" id="audio-verification-link" style="color:#9de6d3;white-space:nowrap;padding:8px">음원 검증</a>
+    <a href="/speech-verification" id="speech-verification-link" style="color:#9de6d3;white-space:nowrap;padding:8px">음성 인식 검증</a>
     <div id="view-runtime-status" role="status" aria-live="polite">상태 확인 중</div>
     <div id="view-stop-controls" aria-label="실행 중단 controls"></div>
   </header>
@@ -8400,7 +8402,7 @@ def runtime_status():
     if not local_access.client_allowed(request.remote_addr):
         return local_access.rejection("trusted_network_required")
     response = jsonify({"test_running": bool(_test_running), "random_running": bool(_random_running),
-                        "record_play_running": bool(_record_play_running), "streaming": bool(_streaming),
+                        "record_play_running": bool(_record_play_running), "speech_running": bool(_speech_running), "streaming": bool(_streaming),
                         "upload_count": len(_test_steps)})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -8464,7 +8466,7 @@ def execution_start():
         return local_access.rejection("trusted_network_required")
     payload = request.get_json(silent=True) or {}
     with _automation_start_lock:
-        if _test_running or _random_running or _record_play_running:
+        if _test_running or _random_running or _record_play_running or _speech_running:
             return jsonify({"error": "Another automation is active"}), 409
         with _test_lock:
             metadata, steps, template = copy.deepcopy(_test_metadata), copy.deepcopy(_test_steps), _test_workbook
@@ -8519,7 +8521,7 @@ def prepare_reviewed_plan():
     if set(payload) - {"selection", "file_hash", "ai_mode"}:
         return jsonify({"error": "지원하지 않는 계획 요청 필드입니다."}), 400
     with _automation_start_lock:
-        if _test_running or _random_running or _record_play_running:
+        if _test_running or _random_running or _record_play_running or _speech_running:
             return jsonify({"error": "진행 중인 자동화를 먼저 종료하세요."}), 409
         with _test_lock:
             template, metadata, steps = _test_workbook, dict(_test_metadata), copy.deepcopy(_test_steps)
@@ -8575,7 +8577,7 @@ def reviewed_operation(plan_id, operation):
                 return jsonify({"error": "POST required"}), 405
             payload = request.get_json(silent=True) or {}
             if operation == "approve":
-                if _test_running or _random_running or _record_play_running:
+                if _test_running or _random_running or _record_play_running or _speech_running:
                     raise ValueError("다른 자동화가 실행 중입니다.")
                 return jsonify(plan.approve(payload))
             if operation == "observe" and not payload:
@@ -8748,7 +8750,7 @@ def serialize_automation_start(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
         with _automation_start_lock:
-            if _test_running or _random_running or _record_play_running:
+            if _test_running or _random_running or _record_play_running or _speech_running:
                 return jsonify({"error": "Another automation is running. Stop it before starting a new run."}), 409
             return handler(*args, **kwargs)
     return wrapped
@@ -9038,8 +9040,18 @@ def on_stop(data=None):
 tc_workflow_service = tc_workflow.register(app, lambda: sys.modules[__name__])
 import audio_service
 audio_verification_service = audio_service.register(app, lambda: sys.modules[__name__])
+import speech_service
+speech_verification_service = speech_service.register(app, lambda: sys.modules[__name__])
+
+
+@app.before_request
+def speech_device_ownership():
+    if (_speech_running and request.method in {'POST', 'PUT', 'PATCH', 'DELETE'}
+            and request.path.startswith('/api/') and not request.path.startswith('/api/speech-verification/')):
+        return jsonify(error='음성 인식 검증이 기기를 사용 중입니다. 해당 화면에서 중단한 뒤 실행하세요.'), 409
 
 if __name__ == "__main__":
+    speech_verification_service.recover()
     print("=" * 55)
     print("Tablet test browser server")
     print(f"Open http://localhost:{local_access_config.PORT}")

@@ -92,7 +92,7 @@ class LocalAccessPolicy:
             return self.rejection(error)
         if request.routing_exception:
             return None  # Let Flask retain 404/405 semantics for authenticated requests.
-        if request.endpoint in {"upload_testcase", "app_analysis.builds", "app_analysis.references"} and request.method == "POST":
+        if request.endpoint in {"upload_testcase", "app_analysis.builds", "app_analysis.references", "speech_verification.assets"} and request.method == "POST":
             if request.mimetype != "multipart/form-data":
                 return self.rejection("multipart_required", 415)
             if not request.mimetype_params.get("boundary"):

@@ -492,3 +492,47 @@ new result ID; existing results and evidence are not rewritten.
   routine tests. Its workbook is specific to the observed TOEIC card screen.
 - Socket.IO 4.7.2 is served locally from `static/vendor/` (MIT license in the
   distributed header), avoiding a mandatory runtime CDN connection.
+
+## 음성 인식 검증 (5000)
+
+`/speech-verification`은 기존 음원 문구 대조와 별개인 실제 앱 발음 평가 검사입니다.
+DB 목록 조회, PCM/WAV 등록, 로컬 일본어 TTS 생성, 기기 녹음 가져오기,
+실행 전 검토, 중단·재개, 회차 비교와 5개 시트의 결과 Excel을 제공합니다.
+
+- 초기 어댑터는 일본어 프리미엄 `com.weaversmind.tjp2`, 빌드 11용입니다.
+  다른 빌드에 동일한 내부 메서드가 있다고 추정해 주입하지 않습니다. 실행마다
+  APK·학습 DB·음성 해시, 디버깅 연결과 메서드 시그니처를 확인합니다.
+- JDK의 `java`/`javac`, ADB, 로컬 EasyOCR 모델이 필요합니다. JDK는
+  `SPEECH_JAVA_HOME`, `JAVA_HOME`, PATH 순서로 찾습니다. 로컬 TTS는
+  `qa_results/tools/local-japanese-tts`의 OpenJTalk 음성·사전이 있어야 합니다.
+  누락된 모델을 자동 다운로드하거나 외부 AI/API로 전환하지 않습니다.
+- 원본 음성은 변경하지 않습니다. 16 kHz·모노·16-bit little-endian PCM/WAV를
+  받으며, 현재 주입 한도는 문장당 15초입니다. 긴 음성을 임의로 자르지 않습니다.
+  새 TTS의 리샘플링·피크 보정은 생성 메타데이터에 남깁니다. 주입 시 무음 추가,
+  속도·음량 변경, PC 스피커 재생은 하지 않습니다.
+- 실제 등급과 내부 단어·길이·피치·에너지 점수를 분리합니다. 엔진 상태 1이나
+  내부 점수만으로 화면 등급을 추정하지 않습니다. 기준 미승인·등급 변동은
+  검토 필요, 대상·전체 입력·캡처 확인 실패는 차단으로 기록합니다.
+  `Bad`를 `Fail` 거절 판정과 동일하게 취급하지 않습니다.
+- 회화는 같은 Session의 4개 문장을 묶어 입력합니다. 각 문장의 정확한 엔진
+  대상과 PNG 캡처 시점·해시를 확인하고, 설치 APK에서 추출한 등급 이미지와
+  화면 픽셀을 비교합니다. 스크롤로 이전 대사가 가려져도 현재 화자의 열을
+  구분하되, 같은 열의 연속 대사 등 구분할 근거가 부족하면 판정을 보류합니다.
+  APK 기준 이미지는 로컬 캐시이며 저장소에 포함하지 않습니다.
+- `qa_results/speech_verification/assets`에 입력 원본을 보관하고,
+  `japanese-premium/<회차 ID>`에 문장·시도별 캡처, 음성, 로그를 저장합니다.
+  대시보드에는 schema version 2로 별도 회차를 기록합니다. 이전 검수 증거를
+  새 자동 실행으로 소급 변환하거나 Redmine에 자동 발행하지 않습니다.
+- 동일 입력 재시도는 최대 한 번이며 최초 결과를 보존합니다. 재개는 새 회차로
+  저장합니다. 서버가 중단되면 디버거 정리 확인 전 다른 기기 입력을 차단합니다.
+  단원 전체의 문장 수집과 앱의 Stage 완료는 별개입니다. 확인되지 않은 학습
+  경로·완료 표시·기준 음원 매핑은 성공으로 추정하지 않습니다.
+- API 접두사는 `/api/speech-verification`입니다. 기존 페이지 토큰·Origin·Host·
+  허용 네트워크 검사를 유지합니다. `preview` 후 `{preview_id, approved:true}`로
+  `run`을 호출하며, `stop`은 중단 요청, `cleanup/check`는 정리 확인입니다.
+  동일 기기의 TC·Random·Recorder 재생과 직접 입력은 동시 수행하지 않습니다.
+- 격리 회귀 검사: `python -B tests/run_isolated.py`. 이 검사는 실기기, AI, 외부
+  연결을 사용하지 않습니다. 실제 주입 검증과 구분하여 해석해야 합니다.
+  Java 디버거 계약 검사는 별도로 `SPEECH_RUN_JAVA_CONTRACT_TESTS=1` 환경에서
+  `python -B -m tests.test_speech_device JdiArgumentTests`를 실행합니다.
+  이 별도 검사도 모의 JVM 객체만 사용하며 태블릿에는 연결하지 않습니다.

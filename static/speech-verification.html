@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="qa-csrf-token" content="__TOKEN__">
+  <title>음성 인식 검증</title>
+  <style>
+    :root{color-scheme:dark;--bg:#171a20;--surface:#24282f;--line:#414752;--text:#eee;--muted:#b5bcc7;--green:#77deae;--amber:#ffd16c;--red:#ff9292}
+    *{box-sizing:border-box;letter-spacing:0}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:24px}h1{font-size:24px;margin:12px 0}h2{font-size:17px;margin:0}h3{font-size:14px;margin:0 0 8px}p{margin:8px 0}a{color:#8edcce}button,input,select,textarea{font:inherit;color:inherit;min-width:0;max-width:100%}button,select,input:not([type=checkbox]):not([type=radio]),textarea{background:#292e38;border:1px solid #56606c;border-radius:4px;padding:8px 10px}button{cursor:pointer;min-height:40px;white-space:normal;overflow-wrap:anywhere}button:hover:not(:disabled){background:#343c46}button.primary{background:#246c57;border-color:#4b9c7f}button.danger{border-color:#ad6363}button:disabled,input:disabled,select:disabled{opacity:.5;cursor:default}button.icon{width:40px;flex:0 0 40px;font-size:20px;padding:4px}button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid #8edcce;outline-offset:3px}input[type=checkbox],input[type=radio]{accent-color:#77cba7;width:17px;height:17px;flex:0 0 17px;margin:0}textarea{resize:vertical;min-height:76px;width:100%}input[type=file]{width:100%;padding:6px!important}input[type=file]::file-selector-button{font:inherit;padding:5px;margin-right:8px}label{min-width:0}fieldset{border:0;margin:0;padding:0;min-width:0}legend{padding:0;margin-bottom:6px;color:var(--muted)}small,.muted{color:var(--muted)}small{display:block;font-size:12px}code{font-size:12px;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;margin:6px 0;max-height:220px;overflow:auto}summary{cursor:pointer;padding:8px 0;overflow-wrap:anywhere}details{min-width:0}dl{margin:0}dd{margin:0;overflow-wrap:anywhere}[hidden]{display:none!important}
+    .heading,.section-heading,.toolbar,.actions,.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}.heading,.section-heading{justify-content:space-between}.section-heading{margin-bottom:12px}.toolbar{margin:12px 0}.actions{margin-top:12px}.field{display:flex;flex-direction:column;gap:6px;min-width:0}.field>span{color:var(--muted);font-size:12px}.field select,.field input{width:100%}.check{display:inline-flex;align-items:center;gap:8px;min-height:36px;overflow-wrap:anywhere}.check span{min-width:0}.badge{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:3px 8px;font-size:12px;overflow-wrap:anywhere}.good{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}.notice{min-height:24px;overflow-wrap:anywhere}.banner{border-left:3px solid var(--amber);background:#272822;padding:10px 12px;margin:12px 0;overflow-wrap:anywhere}.error{color:var(--red);border-color:var(--red);background:#2c2326}
+    .tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-bottom:1px solid var(--line);margin:16px 0 0}.tabs button{border:0;border-radius:0;border-bottom:2px solid transparent;background:transparent;padding:12px 8px;min-height:48px}.tabs button[aria-selected=true]{border-bottom-color:var(--green);color:var(--green);background:#20262a}.band{padding:20px 0;border-bottom:1px solid var(--line)}.environment{display:grid;grid-template-columns:minmax(170px,1fr) minmax(200px,2fr) auto;gap:12px;align-items:end}.filters{display:grid;grid-template-columns:repeat(3,minmax(100px,1fr)) minmax(180px,2fr);gap:12px;align-items:end}.segments{display:inline-flex;flex-wrap:wrap;gap:0;border:1px solid #56606c;border-radius:4px;overflow:hidden}.segments label{padding:8px 12px;min-height:40px;gap:8px;display:flex;align-items:center}.segments label:has(input:checked){background:#294338}.upload-grid{display:grid;grid-template-columns:minmax(140px,1fr) minmax(240px,2fr) minmax(200px,2fr);gap:12px;align-items:start}.format{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--muted)}.split{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.search{width:100%}.table-wrap{overflow:auto;width:100%;max-height:650px;border-top:1px solid var(--line);scrollbar-gutter:stable}table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}th{position:sticky;top:0;background:var(--surface);font-size:12px;font-weight:600;z-index:1}td select{width:100%}td small{margin-top:5px}.catalog-table col:nth-child(1){width:54px}.catalog-table col:nth-child(2){width:27%}.catalog-table col:nth-child(3){width:27%}.catalog-table col:nth-child(4){width:27%}.grades{display:flex;flex-wrap:wrap;gap:2px 12px}.grades .check{font-size:12px;min-height:30px}.approval{display:flex;flex-direction:column;gap:6px}.word-text{white-space:pre-wrap;margin:6px 0}.empty{text-align:center;padding:24px;color:var(--muted)}.pager{justify-content:flex-end;margin-top:10px;font-variant-numeric:tabular-nums}.pager span{min-width:70px;text-align:center}.issues{margin:8px 0;padding-left:22px;max-height:240px;overflow:auto}.issues li{padding:3px 0;overflow-wrap:anywhere}.preview-list{max-height:250px;overflow:auto}.preview-row{padding:8px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:16px 0}.meta dt{color:var(--muted);font-size:12px;margin-bottom:4px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:16px 0;border-block:1px solid var(--line)}.stats>div{padding:12px;border-right:1px solid var(--line)}.stats>div:last-child{border:0}.stats dt{font-size:12px;color:var(--muted)}.stats dd{font-size:24px;font-variant-numeric:tabular-nums}.progress{width:100%;height:10px;accent-color:var(--green)}.attempt{border-top:1px solid var(--line);padding:12px 0}.attempt .meta{grid-template-columns:repeat(2,minmax(0,1fr));margin:8px 0;gap:8px}.media{display:block;width:100%;max-width:600px;margin:8px 0}.media img,.media video{max-width:100%;max-height:420px;object-fit:contain}audio{width:100%;min-width:0}.file-control{padding:8px 0}.file-control button{max-width:100%;text-align:left}.result-table col:nth-child(1){width:24%}.result-table col:nth-child(2){width:18%}.result-table col:nth-child(3){width:18%}.result-table col:nth-child(4){width:40%}.table-wrap.results{max-height:none}.history-actions{display:flex;flex-wrap:wrap;gap:6px}.result-tools{display:grid;grid-template-columns:minmax(160px,1fr) minmax(200px,2fr) auto;gap:12px;align-items:end}.evidence-error{overflow-wrap:anywhere}.full-input{border-left:2px solid #56606c;padding-left:10px}.history-table col:last-child{width:150px}.library-table col:last-child{width:23%}
+    .field>label{color:var(--muted);font-size:12px}
+    #load-catalog{min-width:164px;padding-inline:26px}
+    #load-catalog:not(:disabled){background:#246c57;border-color:#4b9c7f;color:#fff}
+    #load-catalog:hover:not(:disabled){background:#2d8067}
+    .loading-state{display:flex;align-items:center;gap:10px;padding:12px 0;color:var(--green)}
+    .spinner{width:18px;height:18px;flex:0 0 18px;border:2px solid #52645e;border-top-color:var(--green);border-radius:50%;animation:loading-spin .8s linear infinite}
+    @keyframes loading-spin{to{transform:rotate(360deg)}}
+    @media(prefers-reduced-motion:reduce){.spinner{animation:none}}
+    @media(max-width:1000px){.upload-grid{grid-template-columns:1fr 1fr}.upload-grid .transcript{grid-column:1/-1}.catalog-table col:nth-child(2){width:24%}.catalog-table col:nth-child(3){width:25%}.catalog-table col:nth-child(4){width:28%}}
+    @media(max-width:760px){main{padding:16px}.environment,.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.environment>button,.filters>.field:last-child{grid-column:1/-1}.result-tools{grid-template-columns:1fr 1fr}.result-tools>.field:nth-child(2){grid-column:1/-1;grid-row:2}.meta{grid-template-columns:repeat(2,minmax(0,1fr))}.table-wrap{max-height:650px}.responsive-table colgroup,.responsive-table thead{display:none}.responsive-table,.responsive-table tbody,.responsive-table tr,.responsive-table td{display:block;width:100%}.responsive-table tr{padding:12px 0;border-bottom:1px solid var(--line)}.responsive-table td{border:0;padding:5px 10px}.responsive-table td::before{content:attr(data-label);display:block;color:var(--muted);font-size:12px;margin-bottom:4px}.responsive-table td.empty::before{display:none}.responsive-table .select-cell{padding-top:0}.responsive-table .select-cell::before{display:inline;margin-right:12px}.responsive-table .select-cell input{vertical-align:middle}.responsive-table .approval{flex-direction:row;align-items:center;flex-wrap:wrap}.stats>div{padding:10px 8px}.stats dd{font-size:22px}}
+    @media(max-width:420px){main{padding:12px}h1{font-size:22px}.environment,.filters,.upload-grid,.result-tools{grid-template-columns:minmax(0,1fr)}.environment>button,.filters>.field:last-child,.upload-grid .transcript,.result-tools>.field:nth-child(2){grid-column:auto;grid-row:auto}.meta{grid-template-columns:minmax(0,1fr)}.tabs button{font-size:13px;padding-inline:4px}.actions>button{flex:1 1 130px}.stats dt{font-size:11px}.stats dd{font-size:20px}.heading{gap:4px}}
+  </style>
+  <script src="/static/speech-verification.js" defer></script>
+</head>
+<body>
+<main>
+  <a href="/">테스트 실행</a>
+  <div class="heading"><h1>음성 인식 검증</h1><span id="connection-state" class="badge">상태 확인 중</span></div>
+  <div id="connection-error" class="banner error" role="status" hidden></div>
+  <div id="cleanup-notice" class="banner warn" role="status" hidden></div>
+  <div id="cleanup-controls" class="actions" hidden><button id="cleanup-check" type="button" disabled>기기 정리 상태 확인</button></div>
+  <p id="cleanup-result" class="notice" role="status" hidden></p>
+  <p id="notice" class="notice" role="status" aria-live="polite"></p>
+  <nav class="tabs" role="tablist" aria-label="음성 인식 검증">
+    <button id="tab-prepare" type="button" role="tab" aria-selected="true" aria-controls="panel-prepare" tabindex="0">검사 준비</button>
+    <button id="tab-execution" type="button" role="tab" aria-selected="false" aria-controls="panel-execution" tabindex="-1">실행 현황</button>
+    <button id="tab-results" type="button" role="tab" aria-selected="false" aria-controls="panel-results" tabindex="-1">결과·비교</button>
+  </nav>
+
+  <section id="panel-prepare" role="tabpanel" aria-labelledby="tab-prepare">
+    <div id="prepare-loading" class="loading-state" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="prepare-loading-text"></span></div>
+      <section class="band" aria-labelledby="environment-title">
+        <div class="section-heading"><h2 id="environment-title">검사 환경</h2><span class="badge">원본 음원 · 변형 없음</span></div>
+        <div class="environment">
+          <div class="field"><label for="device">기기</label><select id="device"><option value="">기기 선택</option></select></div>
+          <div class="field"><label for="subject">콘텐츠(과목)</label><select id="subject" aria-describedby="subject-state" disabled><option value="">과목 선택</option></select></div>
+          <button id="load-catalog" type="button" disabled>DB 목록 조회</button>
+        </div>
+        <p id="subject-state" class="muted notice" role="status" aria-live="polite">기기 선택 필요</p>
+        <p id="catalog-state" class="muted">DB 목록 미조회</p>
+      </section>
+
+    <fieldset id="prepare-fields">
+      <section class="band" aria-labelledby="assets-title">
+        <div class="section-heading"><h2 id="assets-title">입력 음원</h2><button id="refresh-assets" type="button" class="icon" title="음원 목록 새로고침" aria-label="음원 목록 새로고침">↻</button></div>
+        <form id="asset-form">
+          <div class="actions" style="margin:0 0 12px">
+            <button id="import-native" type="button" title="앱 원본 발음 · 입력 WordID 또는 선택 항목" disabled>기기 음원 가져오기</button>
+            <button id="generate-tts" type="button">TTS 생성</button>
+            <button id="upload-asset" type="submit">음원 등록</button>
+            <button id="import-recordings" type="button" title="기기에 남은 음성인식 입력 PCM과 로그 수집 · 사람/TTS/원본 주입 출처는 별도 확인" disabled>음성인식 입력 기록 가져오기</button>
+          </div>
+          <div class="upload-grid">
+            <label class="field"><span>WordID</span><input id="asset-word-id" required autocomplete="off" maxlength="200"></label>
+            <label class="field"><span>음원 파일</span><input id="asset-file" type="file" accept=".wav,.pcm,audio/wav"></label>
+            <label class="field transcript"><span>발화 문구</span><textarea id="asset-text" required rows="2" maxlength="500"></textarea></label>
+          </div>
+          <div class="format"><span>16,000 Hz</span><span>1 channel</span><span>16-bit PCM</span></div>
+        </form>
+        <div id="asset-loading" class="loading-state" role="status" hidden><span class="spinner" aria-hidden="true"></span><span id="asset-loading-text"></span></div>
+        <p id="asset-state" class="muted" role="status">음원 목록 확인 중</p>
+        <details id="import-report" hidden><summary id="import-summary">입력 기록 가져오기 결과</summary><ul id="import-issues" class="issues"></ul></details>
+        <details id="asset-library"><summary>등록 음원 <span id="asset-count">0</span></summary>
+          <div class="toolbar"><select id="asset-kind" aria-label="음원 종류"><option value="">전체 음원</option><option value="device_recording">음성인식 입력 기록</option><option value="native">앱 원본 음원</option><option value="local-tts">로컬 TTS</option></select><input id="asset-search" type="search" aria-label="등록 음원 검색" placeholder="파일명 · WordID · 발화 문구"></div>
+          <div class="table-wrap" tabindex="0" role="region" aria-label="등록 음원 목록">
+            <table class="responsive-table library-table"><colgroup><col><col><col></colgroup><thead><tr><th>음원 / WordID</th><th>문구 / 형식</th><th>길이 / SHA-256</th></tr></thead><tbody id="asset-rows"></tbody></table>
+          </div>
+        </details>
+      </section>
+
+      <section class="band" aria-labelledby="catalog-title">
+        <div class="section-heading"><h2 id="catalog-title">검사 대상 · 음원 연결</h2><span id="selection-count" class="badge">0개 선택</span></div>
+        <fieldset><legend>검사 범위</legend><div class="segments">
+          <label><input type="radio" name="mode" id="mode-selected" value="selected" checked>선택 항목</label>
+          <label><input type="radio" name="mode" id="mode-unit" value="unit">단원 전체</label>
+        </div></fieldset>
+        <div class="filters toolbar">
+          <label class="field"><span>Level</span><select id="level"><option value="">전체</option></select></label>
+          <label class="field"><span>Week</span><select id="week"><option value="">전체</option></select></label>
+          <label class="field"><span>Stage</span><select id="stage"><option value="">전체</option></select></label>
+          <label class="field"><span>WordID / 문구</span><input id="catalog-search" class="search" type="search" autocomplete="off"></label>
+        </div>
+        <div class="split toolbar"><label class="check"><input id="select-visible" type="checkbox" disabled><span>검색 결과 전체 선택</span></label><span id="scope-state" class="muted">0개 항목</span></div>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="검사 대상 및 기대 판정">
+          <table class="responsive-table catalog-table"><colgroup><col><col><col><col><col></colgroup>
+            <thead><tr><th>선택</th><th>DB 항목</th><th>입력 음원</th><th>기대 판정</th><th>승인</th></tr></thead><tbody id="catalog-rows"></tbody>
+          </table>
+        </div>
+        <div class="pager"><button id="catalog-prev" type="button" class="icon" aria-label="이전 대상 페이지" title="이전 페이지">←</button><span id="catalog-page">1 / 1</span><button id="catalog-next" type="button" class="icon" aria-label="다음 대상 페이지" title="다음 페이지">→</button></div>
+      </section>
+    </fieldset>
+
+    <section class="band" aria-labelledby="preview-title">
+      <div class="section-heading"><h2 id="preview-title">실행 전 검토</h2><span id="ready-state" class="badge warn">미확인</span></div>
+      <p id="preview-summary" class="muted">미리보기 없음</p>
+      <ul id="preview-issues" class="issues"></ul>
+      <details id="preview-details" hidden><summary>서버 검사 대상</summary><div id="preview-items" class="preview-list"></div></details>
+      <div class="actions"><button id="preview-button" type="button" disabled>검사 미리보기</button></div>
+      <label class="check"><input id="run-approved" type="checkbox" disabled><span>검사 대상·기대 판정·기기 실행 및 학습 진도 변경 승인</span></label>
+      <div class="actions"><button id="start-run" type="button" class="primary" disabled>검사 실행</button></div>
+    </section>
+  </section>
+
+  <section id="panel-execution" role="tabpanel" aria-labelledby="tab-execution" hidden>
+    <section class="band" aria-labelledby="execution-title">
+      <div class="section-heading"><h2 id="execution-title">현재 실행</h2><span id="run-state" class="badge">실행 없음</span></div>
+      <dl id="run-meta" class="meta"></dl>
+      <p id="run-progress-text" class="muted">실행 없음</p>
+      <progress id="run-progress" class="progress" max="1" value="0" aria-label="결과 수집 현황"></progress>
+      <dl id="live-summary" class="stats" aria-label="현재 실행 판정 요약"></dl>
+      <div id="run-reason" class="warn"></div>
+      <div class="actions"><button id="stop-run" class="danger" type="button" disabled>실행 중지</button><button id="show-live-results" type="button" disabled>현재 결과 보기</button></div>
+      <div class="actions"><label class="check"><input id="resume-approved" type="checkbox" disabled><span>미완료 항목 재개 승인</span></label><button id="resume-run" type="button" disabled>검사 재개</button></div>
+    </section>
+  </section>
+
+  <section id="panel-results" role="tabpanel" aria-labelledby="tab-results" hidden>
+    <section class="band" aria-labelledby="results-title">
+      <div class="section-heading"><h2 id="results-title">검사 결과</h2><div class="actions"><button id="current-results" type="button">현재 실행</button><button id="export-run" type="button" disabled>결과 내보내기</button></div></div>
+      <p id="result-context" class="muted">선택된 실행 없음</p>
+      <dl id="result-summary" class="stats" aria-label="선택 실행 판정 요약"></dl>
+      <div class="result-tools">
+        <label class="field"><span>판정</span><select id="result-filter"><option value="">전체</option><option value="passed">통과</option><option value="failed">실패</option><option value="blocked">차단</option><option value="unverified">미검증</option></select></label>
+        <label class="field"><span>비교 실행</span><select id="compare-run"><option value="">비교 없음</option></select></label>
+        <button id="clear-compare" type="button">비교 해제</button>
+      </div>
+      <p id="compare-state" class="muted" role="status"></p>
+      <div class="table-wrap results" tabindex="0" role="region" aria-label="WordID별 검사 결과와 비교">
+        <table class="responsive-table result-table"><colgroup><col><col><col><col></colgroup><thead><tr><th>WordID / 문구</th><th>선택 실행</th><th>비교 실행</th><th>시도 / 증거</th></tr></thead><tbody id="result-rows"></tbody></table>
+      </div>
+      <div class="pager"><button id="results-prev" type="button" class="icon" aria-label="이전 결과 페이지" title="이전 페이지">←</button><span id="results-page">1 / 1</span><button id="results-next" type="button" class="icon" aria-label="다음 결과 페이지" title="다음 페이지">→</button></div>
+    </section>
+    <section class="band" aria-labelledby="history-title">
+      <div class="section-heading"><h2 id="history-title">실행 이력</h2><button id="refresh-history" type="button" class="icon" aria-label="실행 이력 새로고침" title="실행 이력 새로고침">↻</button></div>
+      <p id="history-state" class="muted" role="status">이력 확인 중</p>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="과거 실행 이력">
+        <table class="responsive-table history-table"><colgroup><col><col><col><col></colgroup><thead><tr><th>실행 / 시작 시각</th><th>기기 / 범위</th><th>상태</th><th>상세</th></tr></thead><tbody id="history-rows"></tbody></table>
+      </div>
+    </section>
+  </section>
+</main>
+</body>
+</html>

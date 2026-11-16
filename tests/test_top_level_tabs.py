@@ -45,7 +45,7 @@ class TopLevelTabsTests(unittest.TestCase):
     def test_status_endpoint_is_local_read_only_and_cache_disabled(self):
         with patch.object(m,'_test_running',True),patch.object(m,'_random_running',False),patch.object(m,'_record_play_running',True),patch.object(m,'_streaming',True),patch.object(m,'_test_steps',[{}]),patch.object(m,'adb') as adb:
             client=m.app.test_client();response=client.get('/api/runtime/status')
-            self.assertEqual(response.get_json(),{'test_running':True,'random_running':False,'record_play_running':True,'streaming':True,'upload_count':1})
+            self.assertEqual(response.get_json(),{'test_running':True,'random_running':False,'record_play_running':True,'speech_running':False,'streaming':True,'upload_count':1})
             self.assertEqual(response.headers['Cache-Control'],'no-store')
             self.assertEqual(client.post('/api/runtime/status').status_code,405)
             self.assertEqual(client.get('/api/runtime/status',environ_base={'REMOTE_ADDR':'10.0.0.1'}).status_code,403)

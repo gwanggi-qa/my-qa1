@@ -886,7 +886,7 @@ def register(app, host):
         with m._automation_start_lock:
             run = current(job_id)
             run.guard()
-            if m._test_running or m._random_running or m._record_play_running or run.state != 'ready':
+            if m._test_running or m._random_running or m._record_play_running or getattr(m, '_speech_running', False) or run.state != 'ready':
                 raise ValueError('준비 완료된 계획만 저장할 수 있습니다.')
             if p.get('approved') is not True or p.get('plan_digest') != run.digest:
                 raise ValueError('계획과 검사 조건을 확인한 후 승인하세요.')
@@ -920,7 +920,7 @@ def register(app, host):
         m = host()
         p = request.get_json() or {}
         with m._automation_start_lock:
-            if m._test_running or m._random_running or m._record_play_running:
+            if m._test_running or m._random_running or m._record_play_running or getattr(m, '_speech_running', False):
                 raise ValueError('다른 실행이 진행 중입니다.')
             item = library().read(version)
             if 'assertion_revision' in item and (item['assertion_revision'] != expectation_checks.REVISION or
@@ -978,7 +978,7 @@ def register(app, host):
         if not isinstance(indices,list) or not 1<=len(indices)<=20 or any(type(i)is not int for i in indices) or indices!=sorted(set(indices)):
             raise ValueError('원본 순서대로 1~20개 TC를 선택하세요.')
         with m._automation_start_lock:
-            if m._test_running or m._random_running or m._record_play_running:
+            if m._test_running or m._random_running or m._record_play_running or getattr(m, '_speech_running', False):
                 raise ValueError('다른 자동 실행이 진행 중입니다.')
             with m._test_lock:
                 metadata,steps=copy.deepcopy(m._test_metadata),copy.deepcopy(m._test_steps)
@@ -1010,7 +1010,7 @@ def register(app, host):
         m=host()
         p=request.get_json()
         with m._automation_start_lock:
-            if m._test_running or m._random_running or m._record_play_running:
+            if m._test_running or m._random_running or m._record_play_running or getattr(m, '_speech_running', False):
                 raise ValueError('다른 자동 실행이 진행 중입니다.')
             if (run.state!='ready' or not isinstance(p,dict) or
                 set(p)-{'plan_digest','approved','review_reset_token','review_reset_confirmed'} or
